@@ -5,19 +5,17 @@ import {
   getById,
   getByFolder,
   getNotesCountByFolder,
+  notesCountByFolder,
 } from './note/index';
 import {
   getFolderContents,
   searchNotes,
-  getNotesWithPath,
   searchNotesSql,
 } from './note/index';
 import {
   lockNote,
   unlockNote,
   convertNote,
-  uncollapseHeading,
-  migrateLockData,
 } from './note/lock';
 import {
   decryptAllNotesForAppEncryption,
@@ -26,26 +24,26 @@ import {
 import {
   retrieve,
   add,
+  addMany,
   update,
   patchLocal,
   persist,
+  persistMeta,
   deleteNote,
   cleanupDeletedIds,
   moveToFolder,
-  handleFolderDeletion,
   normalizeInvalidFolderIds,
   addLabel,
   removeLabel,
+  retryNoteExtraction,
 } from './note/index';
 import { getBacklinks, getBacklinkCount } from './note/backlinks';
+export { setSkipUndo, clearNoteContentSignatures } from './note/index';
 
 export const useNoteStore = defineStore('note', {
   state: (): NoteState => ({
     data: {},
-    lockStatus: {},
-    isLocked: {},
     syncInProgress: false,
-    deletedIds: {},
   }),
 
   getters: {
@@ -53,9 +51,9 @@ export const useNoteStore = defineStore('note', {
     getById,
     getByFolder,
     getNotesCountByFolder,
+    notesCountByFolder,
     getFolderContents,
     searchNotes,
-    getNotesWithPath,
     getBacklinks,
     getBacklinkCount,
   },
@@ -71,30 +69,30 @@ export const useNoteStore = defineStore('note', {
     decryptAllNotesForAppEncryption,
     persistAllNotesForAppEncryption,
 
-    // Migration
-    migrateLockData,
-
     // CRUD
     add,
+    addMany,
     update,
     patchLocal,
     persist,
+    persistMeta,
     delete: deleteNote,
     cleanupDeletedIds,
 
     // Folder operations
     moveToFolder,
-    handleFolderDeletion,
     normalizeInvalidFolderIds,
 
     // Note locking
     lockNote,
     unlockNote,
     convertNote,
-    uncollapseHeading,
 
     // Labels
     addLabel,
     removeLabel,
+
+    // Share extraction retry (card chip)
+    retryNoteExtraction,
   },
 });

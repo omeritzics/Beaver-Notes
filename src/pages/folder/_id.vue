@@ -1,5 +1,7 @@
 <template>
   <div>
+    <mobile-sync-strip v-if="isMobile" />
+
     <div class="container pt-5">
       <div class="flex flex-col gap-2 mb-6">
         <div class="flex items-center gap-3 min-w-0">
@@ -104,7 +106,7 @@
                   $event,
                   'folder',
                   childFolder.id,
-                  getAllVisibleItems
+                  getAllVisibleItems,
                 )
               "
               @touchstart="
@@ -170,7 +172,7 @@
                   $event.event,
                   'note',
                   $event.noteId,
-                  getAllVisibleItems
+                  getAllVisibleItems,
                 )
               "
               @item-touchstart="
@@ -185,29 +187,30 @@
               @dragend="handleDragEnd($event.event)"
               @update:label="state.activeLabel = $event"
               @update="noteStore.update($event.noteId, $event.payload)"
+              @move="openMoveForNote"
             />
           </template>
         </section>
       </template>
 
-      <div v-else class="text-center">
-        <img
-          :src="$route.query.archived === 'true' ? ArchiveImg : HomeImg"
-          class="mx-auto w-1/4"
-        />
-        <p
-          class="max-w-md mx-auto dark:text-[color:var(--selected-dark-text)] text-gray-600 mt-2"
-        >
-          {{ translations.index.newNote || '-' }}
-        </p>
-      </div>
+      <empty-state
+        v-if="
+          noteStore.notes.length === 0 && folderStore.rootFolders.length === 0
+        "
+        class="flex items-center justify-center min-h-[calc(100vh-250px)]"
+      />
 
       <folder-tree
         v-model="showMoveModal"
-        :notes="selectedNotes"
-        :folders="selectedFolders"
-        :mode="moveMode"
-        @moved="handleMoved"
+        v-bind="
+          resolveMoveModalParams(
+            moveTarget,
+            selectedNotes,
+            selectedFolders,
+            moveMode,
+          )
+        "
+        @moved="moveTarget ? handleSingleMoved : handleMoved"
       />
     </div>
     <actions
@@ -226,30 +229,38 @@ import { useTranslations } from '@/composable/useTranslations';
 import { useRoute, useRouter } from 'vue-router';
 import { useNoteStore } from '@/store/note';
 import { useLabelStore } from '@/store/label';
-import { useDialog } from '@/composable/dialog';
+import { useDialog } from '@/lib/dialog';
 import { sortArray } from '@/utils/helpers/index.js';
+import { memoizedSort } from '@/utils/helpers/memoized-sort.js';
 import HomeNoteMasonry from '@/components/home/HomeNoteMasonry.vue';
-import HomeImg from '@/assets/images/home.png';
-import ArchiveImg from '@/assets/images/archive.png';
 import HomeFolderCard from '@/components/home/HomeFolderCard.vue';
 import { useFolderStore } from '@/store/folder';
 import HomeSearch from '@/components/home/HomeSearch.vue';
 import FolderTree from '@/components/home/FolderTree.vue';
 import Actions from '@/components/home/Actions.vue';
 import { useNotesBrowser } from '@/composable/useNotesBrowser';
-import { extractTextFromContent } from '@/utils/note/serializer.js';
+import { noteSearchText } from '@/utils/note/note-search-text.js';
+import { matchNoteIdsByQuery } from '@/utils/note/search-matches.js';
+import { resolveMoveModalParams } from '@/utils/ui/move-modal-params.js';
+import { useNoteMove } from '@/composable/useNoteMove';
 import { useSelectionBar } from '@/composable/useSelectionBar';
+import EmptyState from '@/components/app/EmptyState.vue';
+import MobileSyncStrip from '@/components/app/MobileSyncStrip.vue';
+import { isMobileRuntime } from '@/lib/tauri/runtime';
 
 export default {
   components: {
     HomeNoteMasonry,
     HomeSearch,
+    EmptyState,
     HomeFolderCard,
     FolderTree,
     Actions,
+    MobileSyncStrip,
   },
   setup() {
     const { translations } = useTranslations();
+    const isMobile = isMobileRuntime();
     const highlightedFolderIds = ref(new Set());
     const route = useRoute();
     const router = useRouter();
@@ -266,11 +277,11 @@ export default {
     const currentFolderId = computed(() => route.params.id);
 
     const sortedNotes = computed(() =>
-      sortArray({
+      memoizedSort({
         data: noteStore.notes,
         order: state.sortOrder,
         key: state.sortBy,
-      })
+      }),
     );
 
     const notes = computed(() => filterNotes(sortedNotes.value));
@@ -280,14 +291,12 @@ export default {
 
       let childFolders = folderStore.folders.filter(
         (f) =>
-          f.parentId === currentFolderId.value && !folderStore.deletedIds[f.id]
+          f.parentId === currentFolderId.value,
       );
 
-      // Filter by archive status:
-      // In archive view, show only archived folders
-      // In normal view, show only non-archived folders
+      // Archive view: only archived folders; normal view: only non-archived.
       childFolders = childFolders.filter((f) =>
-        isArchiveView ? f.isArchived : !f.isArchived
+        isArchiveView ? f.isArchived : !f.isArchived,
       );
 
       return {
@@ -306,6 +315,10 @@ export default {
       const queryLower = state.query.toLocaleLowerCase();
       const isLabelQuery = queryLower.startsWith('#');
       const labelQuery = isLabelQuery ? queryLower.slice(1) : queryLower;
+      const matchedIds =
+        queryLower.trim() !== ''
+          ? matchNoteIdsByQuery(notes, state.query)
+          : null;
 
       notes.forEach((note) => {
         let { title, isArchived, isBookmarked, labels, folderId } = note;
@@ -325,30 +338,35 @@ export default {
           ? labels.includes(state.activeLabel)
           : true;
 
-        const isMatch = isLabelQuery
-          ? labels.some((label) =>
-              label.toLocaleLowerCase().includes(labelQuery)
-            )
-          : labels.some((label) =>
-              label.toLocaleLowerCase().includes(queryLower)
-            ) ||
-            normalizedTitle.toLocaleLowerCase().includes(queryLower) ||
-            (note.searchText ?? extractTextFromContent(note.content))
-              .toLowerCase()
-              .includes(queryLower);
+        let isMatch = false;
+        if (queryLower.trim() !== '') {
+          if (matchedIds === null) {
+            // Index unavailable: linear fallback.
+            isMatch = isLabelQuery
+              ? labels.some((label) =>
+                  label.toLocaleLowerCase().includes(labelQuery),
+                )
+              : labels.some((label) =>
+                  label.toLocaleLowerCase().includes(queryLower),
+                ) ||
+                normalizedTitle.toLocaleLowerCase().includes(queryLower) ||
+                noteSearchText(note).toLowerCase().includes(queryLower);
+          } else {
+            isMatch = matchedIds.has(note.id);
+          }
+        } else {
+          isMatch = true;
+        }
 
         if (isMatch && labelFilter) {
-          const noteCard = {
-            ...note,
-            content: note.searchText ?? extractTextFromContent(note.content),
-          };
-
-          if (isArchived) return filteredNotes.archived.push(noteCard);
+          // Push the original note reference: copying it re-created every
+          // object per keystroke/sort, churning props into a full masonry relayout.
+          if (isArchived) return filteredNotes.archived.push(note);
 
           if (isBookmarked) {
-            filteredNotes.bookmarked.push(noteCard);
+            filteredNotes.bookmarked.push(note);
           } else {
-            filteredNotes.all.push(noteCard);
+            filteredNotes.all.push(note);
           }
         }
       });
@@ -392,6 +410,9 @@ export default {
       listenForLabelEvents: true,
     });
 
+    const { showMoveModal } = pageController;
+    const noteMove = useNoteMove(showMoveModal);
+
     const selectionBar = useSelectionBar();
     watch(
       () => pageController.selectedItems.value,
@@ -402,7 +423,7 @@ export default {
           onMove: pageController.bulkMove,
         });
       },
-      { immediate: true }
+      { immediate: true },
     );
 
     const folder = computed(() => {
@@ -414,7 +435,7 @@ export default {
       if (!currentFolderId.value) return [];
       return folderStore
         .getByParent(currentFolderId.value)
-        .filter((f) => f?.id && !folderStore.deletedIds[f.id])
+        .filter((f) => f?.id)
         .sort((a, b) => a.name.localeCompare(b.name));
     });
 
@@ -441,12 +462,13 @@ export default {
       folders,
       folder,
       deleteLabel,
-      HomeImg,
-      ArchiveImg,
       highlightedFolderIds,
       childFolders,
       notesInFolder,
       folderPath,
+      isMobile,
+      ...noteMove,
+      resolveMoveModalParams,
       ...pageController,
     };
   },
@@ -475,7 +497,9 @@ export default {
 }
 
 .sort-cards-enter-active {
-  transition: opacity 0.01ms linear, transform 0.01ms linear;
+  transition:
+    opacity 0.01ms linear,
+    transform 0.01ms linear;
 }
 
 .sort-cards-enter-from {
@@ -489,7 +513,9 @@ export default {
   }
 
   .sort-cards-enter-active {
-    transition: opacity 200ms ease, transform 200ms ease;
+    transition:
+      opacity 200ms ease,
+      transform 200ms ease;
   }
 }
 </style>

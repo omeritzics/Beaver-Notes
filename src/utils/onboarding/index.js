@@ -1,10 +1,9 @@
-import { DEFAULT_UI_FONT_STACK, getSettingSync, setSetting } from '@/composable/settings';
-import { setStoredZoomLevel } from '@/composable/zoom';
+import { DEFAULT_UI_FONT_STACK, setSetting } from '@/lib/settings';
+import { setStoredZoomLevel } from '@/utils/ui/zoom';
 import { backend } from '@/lib/tauri-bridge';
 import { enableIndexing } from '@/lib/native/spotsearch';
 import { reindexAllNotes } from '@/utils/platform/spotlightSync';
-import { getSyncPath, setSyncPath } from '@/utils/sync/path';
-import { forceSyncNow } from '@/utils/sync';
+import { setSyncPath } from '@/utils/sync/path';
 
 // Re-export the legacy/Electron migration helpers under stable onboarding names.
 export {
@@ -14,7 +13,12 @@ export {
   runLegacyMigrationFromPath as runOnboardingMigrationFromPath,
 } from '@/utils/migration/legacyElectron';
 
-// ─── Animation timing constants ──────────────────────────────────────────────
+import { ONBOARDING_LANGUAGE_CONFIG } from '@/utils/i18n/languages.js';
+export { ONBOARDING_LANGUAGE_CONFIG, ONBOARDING_LANGUAGES } from '@/utils/i18n/languages.js';
+
+export function getLanguageDirection(languageCode) {
+  return ONBOARDING_LANGUAGE_CONFIG[languageCode]?.dir || 'ltr';
+}
 
 export const ENTRANCE_DELAYS = {
   logo: 120,
@@ -28,32 +32,7 @@ export const CURTAIN_DURATIONS = {
   open: 1200,
 };
 
-// ─── Language / theme config data ────────────────────────────────────────────
-
-export const ONBOARDING_LANGUAGE_CONFIG = {
-  ar: { name: 'العربية', dir: 'rtl' },
-  de: { name: 'Deutsch', dir: 'ltr' },
-  en: { name: 'English', dir: 'ltr' },
-  es: { name: 'Español', dir: 'ltr' },
-  fr: { name: 'Français', dir: 'ltr' },
-  it: { name: 'Italiano', dir: 'ltr' },
-  nl: { name: 'Nederlands', dir: 'ltr' },
-  pt: { name: 'Português', dir: 'ltr' },
-  ru: { name: 'Русский', dir: 'ltr' },
-  tr: { name: 'Türkçe', dir: 'ltr' },
-  uk: { name: 'Українська', dir: 'ltr' },
-  vi: { name: 'Tiếng Việt', dir: 'ltr' },
-  zh: { name: '简体中文', dir: 'ltr' },
-};
-
-export const ONBOARDING_LANGUAGES = Object.entries(
-  ONBOARDING_LANGUAGE_CONFIG
-).map(([code, { name }]) => ({
-  code,
-  name,
-  value: code,
-  text: name,
-}));
+// ONBOARDING_LANGUAGE_CONFIG and ONBOARDING_LANGUAGES are re-exported from @/utils/i18n/languages.js
 
 export const ONBOARDING_THEMES = [
   { name: 'light', label: 'Light' },
@@ -63,7 +42,7 @@ export const ONBOARDING_THEMES = [
 
 export const ONBOARDING_ACCENT_COLORS = [
   { name: 'red', className: 'bg-red-500' },
-  { name: 'light', className: 'bg-amber-400' },
+  { name: 'amber', className: 'bg-amber-400' },
   { name: 'green', className: 'bg-emerald-500' },
   { name: 'blue', className: 'bg-blue-400' },
   { name: 'purple', className: 'bg-purple-400' },
@@ -100,12 +79,6 @@ export const ONBOARDING_FONTS = [
   { label: 'Roboto Mono', value: 'Roboto Mono', class: 'font-roboto-mono' },
   { label: 'Ubuntu', value: 'Ubuntu', class: 'font-ubuntu' },
 ];
-
-export function getLanguageDirection(languageCode) {
-  return ONBOARDING_LANGUAGE_CONFIG[languageCode]?.dir || 'ltr';
-}
-
-// ─── Onboarding actions ──────────────────────────────────────────────────────
 
 export async function applyOnboardingFreshPreferences(preferences, { theme }) {
   const languageCode = preferences.language;
@@ -145,57 +118,25 @@ export async function applyOnboardingFreshPreferences(preferences, { theme }) {
   );
 
   const root = document.documentElement;
-  root.classList.forEach((cls) => {
-    if (ONBOARDING_ACCENT_COLOR_NAMES.includes(cls)) {
+  // `dark` is a legacy accent alias, so the sweep strips it; keep the resolved
+  // dark theme across the sweep or Tailwind `dark:` components go light while
+  // the theme tokens stay dark.
+  const keepDark = root.classList.contains('dark');
+  // Include legacy aliases: amber canonical, light/dark same color.
+  const allAccentNames = [...ONBOARDING_ACCENT_COLOR_NAMES, 'light', 'dark'];
+  ;[...root.classList].forEach((cls) => {
+    if (allAccentNames.includes(cls)) {
       root.classList.remove(cls);
     }
   });
   root.classList.add(preferences.accentColor);
+  if (keepDark) root.classList.add('dark');
 }
 
 export async function applyOnboardingSyncPreferences(preferences) {
-  await Promise.all([
-    setSyncPath(preferences.syncPath || ''),
-    setSetting('autoSync', Boolean(preferences.autoSync)),
-  ]);
+  await setSyncPath(preferences.syncPath || '');
 }
 
-export async function markOnboardingCompleted(settingsStorage) {
-  await settingsStorage.set('onboardingCompleted', true);
-}
-
-export async function openOnboardingWorkspace({ store, noteStore, router }) {
-  await getSyncPath();
-
-  // Initialize the workspace Y.Doc — same sequence as useAppShell's
-  // initializeWorkspace so Pinia gets hydrated from Yjs.
-  const { loadWorkspaceDoc, observeWorkspace } = await import('@/composable/useWorkspaceYjs.js');
-  const { writeStoresFromWorkspace } = await import('@/composable/meta-yjs-store.js');
-
-  await loadWorkspaceDoc();
-  observeWorkspace(writeStoresFromWorkspace);
-  await writeStoresFromWorkspace();
-
-  await store.retrieve();
-
-  // One-time batch migration: move existing note content from KV → Yjs
-  const { migrateNotesContent } = await import('./yjs-migration.js');
-  await migrateNotesContent();
-
-  if (backend.isMobileRuntime?.()) {
-    await router.replace('/');
-    return;
-  }
-
-  const [latestNote] = [...noteStore.notes].sort(
-    (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
-  );
-
-  await router.replace(latestNote ? `/note/${latestNote.id}` : '/');
-
-  // Trigger an initial sync so a new client pulling from an existing sync
-  // folder gets all remote data (workspace meta + note content + assets).
-  if (getSettingSync('autoSync')) {
-    forceSyncNow().catch(() => {});
-  }
+export async function markOnboardingCompleted() {
+  await setSetting('onboardingCompleted', true);
 }

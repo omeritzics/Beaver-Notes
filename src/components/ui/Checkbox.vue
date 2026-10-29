@@ -1,7 +1,7 @@
 <template>
   <label class="checkbox-ui inline-flex items-center">
     <div
-      class="relative h-5 w-5 inline-block focus-within:ring-1 ring-secondary rounded-lg"
+      class="relative h-5 w-5 inline-block focus-within:ring-1 ring-secondary rounded-xl"
     >
       <input
         type="checkbox"
@@ -11,7 +11,7 @@
         @change="changeHandler"
       />
       <div
-        class="border rounded-lg absolute top-0 left-0 bg-input checkbox-ui__mark"
+        class="border rounded-xl absolute top-0 ltr:left-0 rtl:right-0 bg-input checkbox-ui__mark"
       >
         <v-remixicon
           name="riCheckLine"
@@ -52,7 +52,7 @@ export default {
     width: 100%;
     height: 100%;
     transition-property: background-color, border-color;
-    transition-timing-function: ease;
+    transition-timing-function: var(--ease-snappy);
     transition-duration: 200ms;
     display: flex;
     align-items: center;
@@ -60,7 +60,7 @@ export default {
     .remixicon-icon {
       transform: scale(0.95) !important;
       opacity: 0;
-      transition: transform 200ms ease, opacity 200ms ease;
+      transition: transform 200ms var(--ease-snappy), opacity 200ms var(--ease-snappy);
     }
   }
   &__input:checked ~ &__mark {

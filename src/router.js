@@ -1,16 +1,20 @@
 import { createRouter, createWebHashHistory } from 'vue-router';
+import { getSettingSync } from '@/lib/settings';
+import Settings from './pages/Settings.vue';
+import Onboarding from './pages/Onboarding.vue';
+import SettingsIndex from './pages/settings/Index.vue';
+import SettingsAppearance from './pages/settings/Appearance.vue';
+import SettingsShortcuts from './pages/settings/Shortcuts.vue';
+import SettingsAbout from './pages/settings/About.vue';
+import SettingsLabels from './pages/settings/Labels.vue';
+import SettingsAccount from './pages/settings/Account.vue';
+import SettingsTeamAdmin from './pages/settings/TeamAdmin.vue';
+import JoinNote from './pages/join/[token].vue';
+import VerifyEmail from './pages/VerifyEmail.vue';
+import ResetPassword from './pages/ResetPassword.vue';
 import Home from './pages/Index.vue';
 import Note from './pages/note/_id.vue';
 import Folder from './pages/folder/_id.vue';
-
-const Settings = () => import('./pages/Settings.vue');
-const Onboarding = () => import('./pages/Onboarding.vue');
-const SettingsIndex = () => import('./pages/settings/Index.vue');
-const SettingsAppearance = () => import('./pages/settings/Appearance.vue');
-const SettingsShortcuts = () => import('./pages/settings/Shortcuts.vue');
-const SettingsAbout = () => import('./pages/settings/About.vue');
-const SettingsLabels = () => import('./pages/settings/Labels.vue');
-const SettingsSecurity = () => import('./pages/settings/Security.vue');
 
 const APP_NAME = 'Beaver Notes';
 
@@ -18,13 +22,13 @@ const routeTitles = {
   Home: APP_NAME,
   Note: 'Note',
   Folder: 'Folder',
-  Settings: `Settings — ${APP_NAME}`,
-  'Settings-Appearance': `Appearance — ${APP_NAME}`,
-  'Settings-Shortcuts': `Shortcuts — ${APP_NAME}`,
-  'Settings-About': `About — ${APP_NAME}`,
-  'Settings-Labels': `Labels — ${APP_NAME}`,
-  'Settings-Security': `Security — ${APP_NAME}`,
-  Onboarding: `Welcome — ${APP_NAME}`,
+  Settings: `Settings - ${APP_NAME}`,
+  'Settings-Appearance': `Appearance - ${APP_NAME}`,
+  'Settings-Shortcuts': `Shortcuts - ${APP_NAME}`,
+  'Settings-About': `About - ${APP_NAME}`,
+  'Settings-Labels': `Labels - ${APP_NAME}`,
+  'Settings-Team': `Team - ${APP_NAME}`,
+  Onboarding: `Welcome - ${APP_NAME}`,
 };
 
 const routes = [
@@ -64,6 +68,16 @@ const routes = [
         component: SettingsAppearance,
       },
       {
+        path: 'account',
+        name: 'Settings-Account',
+        component: SettingsAccount,
+      },
+      {
+        path: 'workspace',
+        name: 'Settings-Team',
+        component: SettingsTeamAdmin,
+      },
+      {
         path: 'shortcuts',
         name: 'Settings-Shortcuts',
         component: SettingsShortcuts,
@@ -78,12 +92,37 @@ const routes = [
         name: 'Settings-Labels',
         component: SettingsLabels,
       },
-      {
-        path: 'security',
-        name: 'Settings-Security',
-        component: SettingsSecurity,
-      },
     ],
+  },
+  {
+    path: '/join/:token',
+    name: 'JoinNote',
+    component: JoinNote,
+    meta: { guest: true },
+  },
+  {
+    path: '/verify-email',
+    name: 'VerifyEmail',
+    component: VerifyEmail,
+    meta: { guest: true },
+  },
+  {
+    path: '/verify-email/:token',
+    name: 'VerifyEmailToken',
+    component: VerifyEmail,
+    meta: { guest: true },
+  },
+  {
+    path: '/reset-password',
+    name: 'ResetPassword',
+    component: ResetPassword,
+    meta: { guest: true },
+  },
+  {
+    path: '/reset-password/:token',
+    name: 'ResetPasswordToken',
+    component: ResetPassword,
+    meta: { guest: true },
   },
   {
     // Catch-all route for footnote links
@@ -115,6 +154,16 @@ const router = createRouter({
 
     return undefined;
   },
+});
+
+router.beforeEach((to) => {
+  // Synchronous check: if onboarding hasn't completed and we're not
+  // already on the onboarding route, redirect there immediately.
+  // This prevents the sidebar from rendering before onboarding is shown.
+  const onboardingCompleted = getSettingSync('onboardingCompleted');
+  if (!onboardingCompleted && to.name !== 'Onboarding') {
+    return { name: 'Onboarding' };
+  }
 });
 
 router.afterEach((to) => {

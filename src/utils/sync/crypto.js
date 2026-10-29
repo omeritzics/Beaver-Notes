@@ -4,17 +4,22 @@ import {
 import {
   syncEncryptPayload,
   syncDecryptPayload,
+  syncDecryptBatch,
   syncKeyReady,
 } from '@/lib/native/security.js';
-import { ENCRYPTED_ASSET_EXT } from './constants.js';
+import { bufToBase64, base64ToBuf } from '@/utils/crypto/codec.js';
 
-// Encryption now runs entirely in Rust. The renderer never sees the items key:
-// it only asks the backend to encrypt/decrypt payloads with an AAD binding.
+// Encryption runs in Rust, renderer never sees items key: backend encrypts with AAD binding.
+// Payloads carry Yjs update as base64 data plus meta, never JSON number arrays.
 
 export async function ensureSyncKeyReadyForWrite() {
   const ready = await syncKeyReady().catch(() => false);
   if (!ready) {
-    if (!isEncryptionEnabled()) return false;
+    if (!isEncryptionEnabled()) {
+      throw new Error(
+        'Encryption is required for sync. Enable encryption in Settings.'
+      );
+    }
     throw new Error(
       'Encryption key is locked. Unlock encryption before syncing.'
     );
@@ -22,10 +27,10 @@ export async function ensureSyncKeyReadyForWrite() {
   return true;
 }
 
-export async function encryptJSON(obj, aad = '') {
-  if (!isEncryptionEnabled()) return JSON.stringify(obj);
+export async function encryptJSON(payload, aad = '') {
+  const { update, ...meta } = payload || {};
   await ensureSyncKeyReadyForWrite();
-  return syncEncryptPayload(JSON.stringify(obj), aad);
+  return syncEncryptPayload(JSON.stringify(meta), bufToBase64(update), aad);
 }
 
 export class SyncCryptoError extends Error {
@@ -37,22 +42,24 @@ export class SyncCryptoError extends Error {
 }
 
 export async function decryptJSON(raw, aad = '') {
-  if (!raw) return null;
-  if (typeof raw !== 'string') return raw;
+  if (typeof raw !== 'string') {
+    throw new Error('sync: non-envelope payload rejected');
+  }
 
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return raw;
+    throw new Error('sync: non-envelope payload rejected');
   }
 
-  if (parsed && parsed.v === 4) {
+  if (parsed && (parsed.v === 4 || parsed.v === 5)) {
     try {
-      const plain = await syncDecryptPayload(raw, aad);
-      return JSON.parse(plain);
+      const res = await syncDecryptPayload(raw, aad);
+      return { ...res.meta, update: base64ToBuf(res.update) };
     } catch (e) {
       const msg = String(e?.message ?? e);
+      if (import.meta.env.DEV) console.warn('[sync][debug] decryptJSON v4/v5 failed:', msg, 'aad:', aad);
       if (msg.includes('KEY_LOCKED')) {
         throw new SyncCryptoError(
           'Encryption is locked. Unlock it in Settings to sync.',
@@ -66,19 +73,19 @@ export async function decryptJSON(raw, aad = '') {
     }
   }
 
-  return parsed;
+  throw new Error('sync: non-envelope payload rejected');
 }
 
-export function clearSyncKey() {}
-
-export function syncAssetName(localFilename) {
-  return isEncryptionEnabled()
-    ? `${localFilename}${ENCRYPTED_ASSET_EXT}`
-    : localFilename;
-}
-
-export function localAssetName(syncFilename) {
-  return syncFilename.endsWith(ENCRYPTED_ASSET_EXT)
-    ? syncFilename.slice(0, -ENCRYPTED_ASSET_EXT.length)
-    : syncFilename;
+/** Batch-decrypt sync envelopes in one IPC call; failed items are `null`. */
+export async function decryptBatch(rawEnvelopes, aads) {
+  if (!rawEnvelopes.length) return [];
+  const results = await syncDecryptBatch(rawEnvelopes, aads);
+  const nullCount = results.filter((r) => !r).length;
+  if (nullCount > 0 && import.meta.env.DEV) {
+    console.warn(`[sync][debug] decryptBatch: ${nullCount}/${results.length} items returned null from Rust`);
+  }
+  return results.map((res) => {
+    if (!res) return null;
+    return { ...res.meta, update: base64ToBuf(res.update) };
+  });
 }

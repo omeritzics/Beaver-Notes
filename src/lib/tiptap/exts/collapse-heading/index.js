@@ -6,6 +6,7 @@ import {
 } from '@tiptap/vue-3';
 import { Plugin } from '@tiptap/pm/state';
 import { mergeCollapsedFootnotes } from '../footnote-block/utils';
+import { collectEmptyHeadingPositions } from './utils';
 
 function createArrowSVG() {
   const svgNS = 'http://www.w3.org/2000/svg';
@@ -168,13 +169,15 @@ export default Heading.extend({
           if (transactions.some((t) => t.getMeta('headingDelete'))) return null;
           const tr = newState.tr;
           let modified = false;
-          newState.doc.descendants((node, pos) => {
-            if (node.type.name === 'heading' && node.content.size === 0) {
-              tr.insertText(' ', pos + 1);
-              modified = true;
-              return false;
-            }
-          });
+          const starts = collectEmptyHeadingPositions(
+            newState.doc,
+            transactions
+          );
+          // Insert from the end so earlier inserts don't shift later positions
+          for (const start of starts.sort((a, b) => b - a)) {
+            tr.insertText(' ', start + 1);
+            modified = true;
+          }
           return modified ? tr : null;
         },
       }),
@@ -405,7 +408,7 @@ export default Heading.extend({
       container.style.position = 'relative';
 
       const content = document.createElement(`h${node.attrs.level}`);
-      content.style.marginLeft = '30px'; // Adjust based on your design
+      content.style.marginLeft = '30px';
       content.style.position = 'relative';
 
       const indicator = createArrowSVG();
@@ -414,8 +417,8 @@ export default Heading.extend({
       indicator.style.position = 'absolute';
       indicator.style.left = '0';
       indicator.style.top = '50%';
-      indicator.style.transform = 'translateY(-50%)'; // Center vertically
-      indicator.style.transition = 'transform 0.3s'; // Smooth rotation transition
+      indicator.style.transform = 'translateY(-50%)';
+      indicator.style.transition = 'transform 0.3s';
 
       const updateIndicator = () => {
         if (node.attrs.open) {
@@ -427,7 +430,6 @@ export default Heading.extend({
 
       updateIndicator();
 
-      // Toggle state on indicator click
       indicator.addEventListener('click', () => {
         if (node.attrs.open) {
           editor.commands.collapsedHeading();

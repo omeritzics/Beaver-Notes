@@ -1,14 +1,20 @@
 
-import { isEncryptionEnabled } from '@/utils/crypto/encryption.js';
 import { backend, path } from '@/lib/tauri-bridge';
+import { copyPath } from '@/lib/native/fs';
 import { getAppDirectory } from '@/lib/native/app';
 import { base64ToUint8Array } from '@/utils/helpers/index.js';
+import { speed } from '@/utils/speed.js';
 
 function sourceFileName(file) {
   if (typeof file === 'string') {
     return path.basename(file);
   }
   return file?.name || 'file';
+}
+
+/** Display name for a picked/dropped file (string path or File). */
+export function assetFileName(file) {
+  return sourceFileName(file);
 }
 
 async function readFileAsBytes(file) {
@@ -53,36 +59,41 @@ async function readFileAsUint32(file) {
   });
 }
 
-// ─── Document / file saving ──────────────────────────────────────────────────
-
 async function createFileDestination(file, id) {
   const appDirectory = await getAppDirectory();
   const { ext, name } = path.parse(sourceFileName(file));
   const fileName = `${name}${ext}`;
-  const assetsPath = path.join(appDirectory, 'file-assets', id);
+  const assetsPath = path.join(appDirectory, 'assets', id);
   await backend.invoke('fs:ensureDir', assetsPath);
   const destPath = path.join(assetsPath, fileName);
   return { destPath, fileName };
 }
 
 export async function saveFile(file, id) {
+  if (!id) {
+    throw new Error('Cannot save file asset: missing note id');
+  }
+  const t = speed('asset_save_file');
   try {
-    const contentUint8Array = await readFileAsBytes(file);
     const { fileName, destPath } = await createFileDestination(file, id);
-    const relativePath = `file-assets://${id}/${fileName}`;
-    await backend.invoke('fs:writeFile', {
-      data: contentUint8Array,
-      path: destPath,
-      skipAssetEncryption: !isEncryptionEnabled(),
-    });
+    if (typeof file === 'string') {
+      // Rust streams the encrypt; the file never enters the WebView.
+      await copyPath(file, destPath);
+    } else {
+      const contentUint8Array = await readFileAsBytes(file);
+      await backend.invoke('fs:writeFile', {
+        data: contentUint8Array,
+        path: destPath,
+      });
+    }
+    const relativePath = `assets://${id}/${fileName}`;
+    t?.end();
     return { fileName, relativePath };
   } catch (error) {
     console.error(error);
-    throw new Error('Failed to save file');
+    throw new Error('Failed to save file', { cause: error });
   }
 }
-
-// ─── Image saving ────────────────────────────────────────────────────────────
 
 async function sha256Hex(input) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
@@ -93,7 +104,7 @@ async function createImageDestination(file, id, timestamp) {
   const appDirectory = await getAppDirectory();
   const { ext, name } = path.parse(sourceFileName(file));
   const fileName = `${await sha256Hex(name + timestamp)}${ext}`;
-  const assetsPath = path.join(appDirectory, 'notes-assets', id);
+  const assetsPath = path.join(appDirectory, 'assets', id);
   await backend.invoke('fs:ensureDir', assetsPath);
   const destPath = path.join(assetsPath, fileName);
   return { destPath, fileName };
@@ -101,13 +112,17 @@ async function createImageDestination(file, id, timestamp) {
 
 async function copyImage(file, id, timestamp) {
   const ts = timestamp || Date.now();
-  const content = await readFileAsUint32(file);
   const { fileName, destPath } = await createImageDestination(file, id, ts);
-  await backend.invoke('fs:writeFile', {
-    data: content,
-    path: destPath,
-    skipAssetEncryption: !isEncryptionEnabled(),
-  });
+  if (typeof file === 'string') {
+    // Rust streams the encrypt; the file never enters the WebView.
+    await copyPath(file, destPath);
+  } else {
+    const content = await readFileAsUint32(file);
+    await backend.invoke('fs:writeFile', {
+      data: content,
+      path: destPath,
+    });
+  }
 
   return { destPath, fileName };
 }

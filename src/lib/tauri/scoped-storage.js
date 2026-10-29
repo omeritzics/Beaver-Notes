@@ -10,6 +10,7 @@ import {
   stat as scopedStat,
   writeFile as scopedWriteFile,
 } from 'tauri-plugin-scoped-storage-api';
+import { invoke } from '@tauri-apps/api/core';
 import { invokeCommand } from './commands';
 import { basenameSync, buildPath, extnameSync, parseSync } from './path';
 import { isMobileRuntime } from './runtime';
@@ -54,13 +55,6 @@ function uniqueToken() {
     typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function sanitizeFileName(value, fallback = 'file') {
-  const normalized = String(value || '')
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
-    .trim();
-  return normalized || fallback;
 }
 
 function hasDialogProperty(payload, property) {
@@ -114,20 +108,11 @@ function toUint8Array(data) {
   return textEncoder.encode(String(data));
 }
 
-function uint8ArrayToBase64(data) {
-  const bytes = toUint8Array(data);
-  let binary = '';
-  const chunkSize = 0x8000;
-
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-}
-
-import { base64ToUint8Array } from '@/utils/helpers/index.js';
+import {
+  base64ToUint8Array,
+  sanitizeFileName,
+  uint8ArrayToBase64,
+} from '@/utils/helpers/index.js';
 
 function isScopedPath(value) {
   return String(value || '').startsWith(SCOPED_PATH_PREFIX);
@@ -161,28 +146,15 @@ async function resolveAssetVirtualPath(value) {
   );
   if (!normalized) return normalized;
 
-  const fileAssetMatch = normalized.match(/^file-assets:\/\/([^/]+)\/(.+)$/);
-  if (fileAssetMatch) {
+  const assetMatch = normalized.match(/^(?:assets|file-assets):\/\/([^/]+)\/(.+)$/);
+  if (assetMatch) {
     const appDirectory = await getAppDirectory();
     return appDirectory
       ? buildPath(
           appDirectory,
-          'file-assets',
-          fileAssetMatch[1],
-          fileAssetMatch[2]
-        )
-      : normalized;
-  }
-
-  const noteAssetMatch = normalized.match(/^assets:\/\/([^/]+)\/(.+)$/);
-  if (noteAssetMatch) {
-    const appDirectory = await getAppDirectory();
-    return appDirectory
-      ? buildPath(
-          appDirectory,
-          'notes-assets',
-          noteAssetMatch[1],
-          noteAssetMatch[2]
+          'assets',
+          assetMatch[1],
+          assetMatch[2]
         )
       : normalized;
   }
@@ -191,7 +163,8 @@ async function resolveAssetVirtualPath(value) {
 }
 
 async function describeFsTarget(value) {
-  const resolvedPath = await resolveAssetVirtualPath(value);
+  const target = value?.path ?? value;
+  const resolvedPath = await resolveAssetVirtualPath(target);
   const scoped = parseScopedPath(resolvedPath);
 
   if (scoped) {
@@ -260,6 +233,21 @@ async function readdirAt(target) {
   }
 
   return invokeCommand('fs:readdir', target.resolvedPath);
+}
+
+export function kickSyncDir(value) {
+  describeFsTarget(value)
+    .then((target) => {
+      if (target.kind !== 'scoped') return;
+
+      return invoke('plugin:scoped-storage|warm_folder', {
+        req: {
+          folderId: target.folderId,
+          path: target.relativePath || undefined,
+        },
+      });
+    })
+    .catch(() => {});
 }
 
 async function readBinaryAt(target) {
@@ -464,6 +452,32 @@ function pickFilesWithBrowserInput(payload = {}) {
   });
 }
 
+const STAGING_CHUNK_BYTES = 4 * 1024 * 1024;
+
+// Browser File/Blob inputs have no filesystem path, so bytes must cross IPC. Writing
+// in bounded chunks keeps peak WebView memory at one chunk instead of the whole file.
+async function stageFileToDisk(file, destination) {
+  const size = file.size ?? 0;
+  if (size <= STAGING_CHUNK_BYTES) {
+    await invokeCommand('fs:writeFile', {
+      path: destination,
+      data: new Uint8Array(await file.arrayBuffer()),
+    });
+    return;
+  }
+  await invokeCommand('fs:writeFile', {
+    path: destination,
+    data: new Uint8Array(await file.slice(0, STAGING_CHUNK_BYTES).arrayBuffer()),
+  });
+  for (let offset = STAGING_CHUNK_BYTES; offset < size; offset += STAGING_CHUNK_BYTES) {
+    const chunk = await file.slice(offset, offset + STAGING_CHUNK_BYTES).arrayBuffer();
+    await invokeCommand('fs:appendFile', {
+      path: destination,
+      data: new Uint8Array(chunk),
+    });
+  }
+}
+
 async function stageMobileSelectedFiles(files) {
   if (!files.length) return [];
 
@@ -492,13 +506,8 @@ async function stageMobileSelectedFiles(files) {
 
     usedNames.add(candidateName);
 
-    const bytes = new Uint8Array(await file.arrayBuffer());
     const destination = buildPath(stagingRoot, candidateName);
-    await invokeCommand('fs:writeFile', {
-      path: destination,
-      data: bytes,
-      skipAssetEncryption: true,
-    });
+    await stageFileToDisk(file, destination);
     stagedPaths.push(destination);
   }
 

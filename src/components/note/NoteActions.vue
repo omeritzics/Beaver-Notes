@@ -1,10 +1,9 @@
 <template>
-  <!-- Desktop -->
   <div
     ref="container"
-    class="bg-white dark:bg-neutral-900 border overflow-x-auto w-fit p-1 rounded-lg shadow-sm no-print max-w-content mobile:hidden"
+    class="bg-white dark:bg-neutral-900 border overflow-x-auto w-fit p-1 rounded-xl shadow-sm no-print max-w-content mobile:hidden"
     :class="{
-      'opacity-0 hover:opacity-100 transition-opacity': store.inReaderMode,
+      'opacity-0 hover:opacity-100 focus-within:opacity-100 transition-opacity': store.inReaderMode,
     }"
     @wheel.passive="changeWheelDirection"
   >
@@ -40,20 +39,67 @@
           </button>
         </template>
 
-        <button
-          v-for="s in shareActions"
-          :key="s.name"
-          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
-          @click="s.handler"
-        >
-          <v-remixicon :name="s.icon" />
-          <span
-            class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
+        <ui-list>
+          <ui-list-item
+            v-if="isAuthenticated"
+            tag="button"
+            class="gap-2 text-left"
+            @click="showShareModal = true"
           >
-            {{ s.title }}
-          </span>
-        </button>
+            <v-remixicon name="riUserSharedLine" />
+            <span
+              class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
+            >
+              {{ translations.share?.collaborate || 'Collaborate' }}
+            </span>
+          </ui-list-item>
+
+          <hr v-if="isAuthenticated" class="border-t my-1" />
+
+          <ui-list-item
+            v-for="s in shareActions"
+            :key="s.name"
+            tag="button"
+            class="gap-2 text-left"
+            @click="s.handler"
+          >
+            <v-remixicon :name="s.icon" />
+            <span
+              class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
+            >
+              {{ s.title }}
+            </span>
+          </ui-list-item>
+        </ui-list>
       </ui-popover>
+
+      <button
+        v-if="isAuthenticated"
+        v-tooltip.group="'History'"
+        :aria-label="'History'"
+        :class="{ 'is-active': showHistory }"
+        class="hoverable h-8 px-1 rounded-lg transition-colors flex items-center"
+        @click="$emit('toggle-history')"
+      >
+        <v-remixicon name="riHistoryLine" />
+      </button>
+
+      <button
+        v-if="isAuthenticated"
+        v-tooltip.group="translations.comments?.title || 'Comments'"
+        :aria-label="translations.comments?.title || 'Comments'"
+        :class="{ 'is-active': showComments }"
+        class="hoverable h-8 px-1 rounded-lg transition-colors flex items-center"
+        @click="$emit('toggle-comments')"
+      >
+        <v-remixicon name="riChat3Line" />
+      </button>
+
+      <presence-avatars
+        v-if="showCollaboration"
+        :peers="peers"
+        class="mx-0.5"
+      />
 
       <button
         v-tooltip.group="translations.menu.readerMode"
@@ -78,8 +124,12 @@
       <ui-popover>
         <template #trigger>
           <button
-            v-tooltip.group="translations.noteActions?.noteActions || 'Note actions'"
-            :aria-label="translations.noteActions?.noteActions || 'Note actions'"
+            v-tooltip.group="
+              translations.noteActions?.noteActions || 'Note actions'
+            "
+            :aria-label="
+              translations.noteActions?.noteActions || 'Note actions'
+            "
             class="hoverable h-8 px-1 rounded-lg transition-colors flex items-center"
           >
             <v-remixicon name="riEqualizer3Line" />
@@ -87,7 +137,7 @@
         </template>
 
         <button
-          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
           :class="{ 'text-primary': note.isBookmarked }"
           @click="toggleBookmark"
         >
@@ -97,12 +147,16 @@
           <span
             class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
           >
-            {{ note.isBookmarked ? translations.noteActions?.removeBookmark || 'Remove bookmark' : translations.noteActions?.bookmark || 'Bookmark' }}
+            {{
+              note.isBookmarked
+                ? translations.noteActions?.removeBookmark || 'Remove bookmark'
+                : translations.noteActions?.bookmark || 'Bookmark'
+            }}
           </span>
         </button>
 
         <button
-          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
           :class="{ 'text-primary': note.isArchived }"
           @click="toggleArchive"
         >
@@ -112,12 +166,16 @@
           <span
             class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
           >
-            {{ note.isArchived ? (translations.noteActions?.unarchive || 'Unarchive') : (translations.noteActions?.archive || 'Archive') }}
+            {{
+              note.isArchived
+                ? translations.noteActions?.unarchive || 'Unarchive'
+                : translations.noteActions?.archive || 'Archive'
+            }}
           </span>
         </button>
 
         <button
-          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
           @click="lockNote"
         >
           <v-remixicon name="riLockLine" />
@@ -146,7 +204,7 @@
         <hr class="border-t my-1 border-neutral-200 dark:border-neutral-700" />
 
         <div
-          class="flex w-full items-center justify-between gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          class="flex w-full items-center justify-between gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
         >
           <div class="flex items-center gap-2">
             <v-remixicon name="riExpandWidthLine" />
@@ -162,11 +220,24 @@
           />
         </div>
 
+        <button
+          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
+          :class="{ 'text-primary': note.showWordCount }"
+          @click="toggleWordCount"
+        >
+          <v-remixicon name="riParagraph" />
+          <span
+            class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
+          >
+            {{ translations.noteActions?.wordCount || 'Word count' }}
+          </span>
+        </button>
+
         <hr class="border-t my-1 border-neutral-200 dark:border-neutral-700" />
 
         <!-- Copy note content -->
         <button
-          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+          class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left hoverable transition-colors"
           @click="copyNoteContent"
         >
           <v-remixicon
@@ -175,20 +246,23 @@
           <span
             class="block text-sm font-medium dark:text-[color:var(--selected-dark-text)]"
           >
-            {{ copyState === 1 ? (translations.noteActions?.copied || 'Copied!') : (translations.noteActions?.copyContent || 'Copy content') }}
+            {{
+              copyState === 1
+                ? translations.noteActions?.copied || 'Copied!'
+                : translations.noteActions?.copyContent || 'Copy content'
+            }}
           </span>
         </button>
       </ui-popover>
     </div>
   </div>
 
-  <!-- Mobile -->
   <div
     ref="shellRef"
     class="editor-actions-mobile-shell sticky z-[160] no-print transition-opacity duration-150 w-full bg-white/90 dark:bg-neutral-900/90 top-0 mb-4 hidden mobile:flex"
     :style="shellStyle"
   >
-    <div class="flex w-full items-center justify-between p-1.5">
+    <div class="flex w-full items-center justify-between">
       <button
         aria-label="Back"
         class="flex h-10 w-10 items-center justify-center rounded-xl text-neutral-600 transition-colors hover:bg-black/5 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-white/10 dark:hover:text-white"
@@ -199,9 +273,28 @@
 
       <div class="flex items-center gap-1">
         <button
+          v-if="isAuthenticated"
+          :aria-label="'History'"
+          class="flex h-10 w-10 items-center justify-center rounded-xl text-neutral-600 transition-colors hover:bg-black/5 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-white/10 dark:hover:text-white"
+          @click="$emit('toggle-history')"
+        >
+          <v-remixicon name="riHistoryLine" />
+        </button>
+        <button
+          v-if="isAuthenticated"
+          :aria-label="translations.comments?.title || 'Comments'"
+          class="flex h-10 w-10 items-center justify-center rounded-xl transition-colors"
+          :class="showComments
+            ? 'bg-primary/10 text-primary dark:bg-secondary/10 dark:text-secondary'
+            : 'text-neutral-600 hover:bg-black/5 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-white/10 dark:hover:text-white'"
+          @click="$emit('toggle-comments')"
+        >
+          <v-remixicon name="riChat3Line" />
+        </button>
+        <button
           :aria-label="translations.menu.share"
           class="flex h-10 w-10 items-center justify-center rounded-xl text-neutral-600 transition-colors hover:bg-black/5 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-white/10 dark:hover:text-white"
-          @click="showShareDialog = true"
+          @click="showShareModal = true"
         >
           <v-remixicon name="riShare2Line" />
         </button>
@@ -233,116 +326,103 @@
     </div>
   </div>
 
-  <!-- Share modal (mobile only)  -->
-  <ui-modal v-model="showShareDialog" content-class="max-w-sm">
-    <template #header>
-      <h3 class="text-lg font-semibold">
-        {{ translations.menu.share || 'Share' }}
-      </h3>
-    </template>
-
-    <div class="grid gap-2 p-2">
-      <button
-        v-for="s in shareActions"
-        :key="s.name"
-        class="flex items-center gap-3 rounded-xl px-3 py-3 text-left text-neutral-700 transition-colors hover:bg-black/5 dark:text-neutral-100 dark:hover:bg-white/10"
-        @click="s.handler"
-      >
-        <v-remixicon :name="s.icon" />
-        <span class="min-w-0 flex-1">
-          <span class="block text-sm font-medium">{{ s.title }}</span>
-        </span>
-      </button>
-    </div>
-  </ui-modal>
+  <share-modal v-model="showShareModal" :note-id="id" :share-actions="shareActions" />
+  <history-panel
+    v-if="showHistory"
+    :note-id="id"
+    :editor="editor"
+    @close="$emit('toggle-history'); $emit('preview', null)"
+    @restore="$emit('restore', $event)"
+    @preview="$emit('preview', $event)"
+    @review="$emit('review', $event)"
+  />
 </template>
 
 <script>
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useNoteMenu } from '@/composable/useNoteMenu';
 import { useNoteStore } from '@/store/note';
-import { usePasswordStore } from '@/store/passwd';
 import { useClipboard } from '@/composable/clipboard';
-import { useDialog } from '@/composable/dialog';
+import { useDialog } from '@/lib/dialog';
 import { useTranslations } from '@/composable/useTranslations';
 import { extractTextFromContent } from '@/utils/note/serializer.js';
 import { verifyPassphrase } from '@/utils/crypto/encryption.js';
+import { useAccountStore } from '@/store/account';
+import HistoryPanel from '@/components/note/HistoryPanel.vue';
+import PresenceAvatars from '@/components/note/PresenceAvatars.vue';
+import ShareModal from '@/components/note/ShareModal.vue';
 export default {
+  components: {
+    HistoryPanel,
+    PresenceAvatars,
+    ShareModal,
+  },
   props: {
     editor: { type: Object, default: () => ({}) },
     id: { type: String, default: '' },
     note: { type: Object, required: true },
     goBack: { type: Function, required: true },
     showSearch: { type: Boolean, default: false },
+    peers: { type: [Map, Object], default: () => ({}) },
+    localColor: { type: String, default: '' },
+    localName: { type: String, default: 'Anonymous' },
+    showHistory: { type: Boolean, default: false },
+    showComments: { type: Boolean, default: false },
   },
-  emits: ['toggle-search'],
+  emits: [
+    'toggle-search',
+    'toggle-history',
+    'toggle-comments',
+    'restore',
+    'preview',
+    'review',
+  ],
   setup(props) {
     const menu = useNoteMenu(props);
     const noteStore = useNoteStore();
+    const accountStore = useAccountStore();
     const shellRef = ref(null);
-    const showShareDialog = ref(false);
+    const showShareModal = ref(false);
     const isStuck = ref(false);
     const { copyState, copyToClipboard } = useClipboard();
 
+    const isAuthenticated = computed(() => accountStore.isAuthenticated);
+    const hasOnlinePeers = computed(() => {
+      const p = props.peers;
+      return p instanceof Map ? p.size > 0 : Object.keys(p).length > 0;
+    });
+    const showCollaboration = computed(
+      () => isAuthenticated.value && hasOnlinePeers.value,
+    );
+
     function lockNote() {
-      const passwordStore = usePasswordStore();
-      const noteStore = useNoteStore();
       const dialog = useDialog();
+      const noteStore = useNoteStore();
       const { translations } = useTranslations();
       const t = translations.value.card;
       const dlg = translations.value.dialog;
       const settings = translations.value.settings;
 
-      passwordStore.retrieve().then((hasSharedKey) => {
-        if (!hasSharedKey) {
-          dialog.prompt({
-            title: t.enterPasswd || 'Set a password',
-            okText: t.setKey || 'Set Key',
-            body: t.warning || 'Set a password to lock this note.',
-            cancelText: t.cancel || 'Cancel',
-            placeholder: t.password || 'Password',
-            onConfirm: async (newKey) => {
-              if (newKey) {
-                try {
-                  await passwordStore.setSharedKey(newKey);
-                  await verifyPassphrase(newKey);
-                  await noteStore.lockNote(props.note.id, newKey);
-                } catch {
-                  dialog.alert({
-                    title: t.keyFail || 'Error',
-                    body: t.keyFail || 'Failed to lock note.',
-                    okText: dlg?.close || 'Close',
-                  });
-                }
-              }
-            },
-          });
-        } else {
-          dialog.prompt({
-            title: t.enterPasswd || 'Enter password',
-            body:
-              t.warning ||
-              'Warning, if you forget your password, you will lose access to your locked notes.',
-            icon: 'riLockLine',
-            okText: t.lock || 'Lock',
-            cancelText: t.cancel || 'Cancel',
-            placeholder: t.password || 'Password',
-            onConfirm: async (enteredPassword) => {
-              const isValid = await passwordStore.isValidPassword(
-                enteredPassword
-              );
-              if (isValid) {
-                await noteStore.lockNote(props.note.id, enteredPassword);
-              } else {
-                dialog.alert({
-                  title: settings?.alertTitle || 'Alert',
-                  body: t.wrongPasswd || 'Wrong password.',
-                  okText: dlg?.close || 'Close',
-                });
-              }
-            },
-          });
-        }
+      dialog.prompt({
+        title: t.enterPasswd || 'Enter vault key',
+        body: t.warning || 'Enter your vault key to lock this note.',
+        icon: 'riLockLine',
+        okText: t.lock || 'Lock',
+        cancelText: t.cancel || 'Cancel',
+        placeholder: t.password || 'Vault key',
+        password: true,
+        onConfirm: async (enteredPassword) => {
+          const result = await verifyPassphrase(enteredPassword);
+          if (result.ok) {
+            await noteStore.lockNote(props.note.id);
+          } else {
+            dialog.alert({
+              title: settings?.alertTitle || 'Alert',
+              body: result.error || t.wrongPasswd || 'Wrong vault key.',
+              okText: dlg?.close || 'Close',
+            });
+          }
+        },
       });
     }
 
@@ -361,6 +441,12 @@ export default {
     function toggleFullWidth() {
       noteStore.update(props.note.id, {
         isFullWidth: !props.note.isFullWidth,
+      });
+    }
+
+    function toggleWordCount() {
+      noteStore.update(props.note.id, {
+        showWordCount: !props.note.showWordCount,
       });
     }
 
@@ -406,10 +492,13 @@ export default {
       toggleBookmark,
       toggleArchive,
       toggleFullWidth,
+      toggleWordCount,
       copyNoteContent,
       lockNote,
       syncStickyState,
-      showShareDialog,
+      showShareModal,
+      isAuthenticated,
+      showCollaboration,
     };
   },
 };
@@ -437,6 +526,8 @@ input[type='number'] {
 }
 
 .editor-actions-mobile-shell {
-  transition: box-shadow 180ms ease, background-color 180ms ease;
+  transition:
+    box-shadow var(--motion-fast) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
 }
 </style>

@@ -1,6 +1,9 @@
+//! DEPRECATED: Legacy CryptoJS encryption format handlers.
+//! This module exists solely for one-time migration from Electron-era data.
+//! Remove after the migration window closes.
+
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use aes::Aes256;
-use base64::Engine as _;
 use cbc::Decryptor;
 
 use super::super::AppError;
@@ -10,7 +13,7 @@ fn evp_bytes_to_key(password: &[u8], salt: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut prev = [0u8; 16];
     while derived.len() < 48 {
         let mut ctx = md5::Context::new();
-        ctx.consume(&prev);
+        ctx.consume(prev);
         ctx.consume(password);
         ctx.consume(salt);
         prev = ctx.compute().0;

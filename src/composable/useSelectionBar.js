@@ -1,9 +1,6 @@
 import { reactive, ref, computed } from 'vue';
 import { useNoteStore } from '@/store/note';
 import { useFolderStore } from '@/store/folder';
-import { usePasswordStore } from '@/store/passwd';
-import { useDialog } from '@/composable/dialog';
-import { useTranslations } from '@/composable/useTranslations';
 import { useUndoStore } from '@/store/undo';
 import { parseItemId } from '@/utils/helpers/index.js';
 
@@ -16,6 +13,7 @@ export function useSelectionBar() {
   let clearFn = null;
   let deleteFn = null;
   let moveFn = null;
+  let customizeFn = null;
 
   const noteStore = useNoteStore();
   const folderStore = useFolderStore();
@@ -78,11 +76,14 @@ export function useSelectionBar() {
     return lockedCount < notes.length / 2;
   });
 
+  const showCustomize = computed(() => selectedFolders.value.length === 1 && selectedNotes.value.length === 0);
+
   function syncSelection(items, handlers = {}) {
     selectedKeys.value = items;
     if (handlers.onClear) clearFn = handlers.onClear;
     if (handlers.onDelete) deleteFn = handlers.onDelete;
     if (handlers.onMove) moveFn = handlers.onMove;
+    if (handlers.onCustomize) customizeFn = handlers.onCustomize;
   }
 
   function clearSelection() {
@@ -98,6 +99,14 @@ export function useSelectionBar() {
   function moveSelection() {
     if (!moveFn) return false;
     moveFn();
+    return true;
+  }
+
+  function customizeSelection() {
+    if (!customizeFn) return false;
+    const id = selectedFolders.value[0]?.id;
+    if (!id) return false;
+    customizeFn(id);
     return true;
   }
 
@@ -124,86 +133,26 @@ export function useSelectionBar() {
   }
 
   async function toggleLock() {
-    const dialog = useDialog();
-    const passwordStore = usePasswordStore();
-    const { translations } = useTranslations();
-    const t = translations.value;
-
-    const hasSharedKey = await passwordStore.retrieve();
-
-    if (!hasSharedKey) {
-      dialog.prompt({
-        title: t.card?.enterPasswd || 'Set a password',
-        okText: t.card?.setKey || 'Set Key',
-        body: t.card?.warning || 'Set a password to lock these notes.',
-        cancelText: t.card?.cancel || 'Cancel',
-        placeholder: t.card?.password || 'Password',
-        onConfirm: async (newKey) => {
-          if (!newKey) return;
-          try {
-            await passwordStore.setSharedKey(newKey);
-            for (const note of selectedNotes.value) {
-              if (!note.isLocked) {
-                await noteStore.lockNote(note.id, newKey);
-              }
-            }
-            clearSelection();
-          } catch {
-            dialog.alert({
-              title: t.settings?.alertTitle || 'Error',
-              body: t.card?.keyFail || 'Failed to lock notes.',
-              okText: t.dialog?.close || 'Close',
-            });
-          }
-        },
-      });
-      return;
-    }
-
     const shouldLockNotes = shouldLock.value;
 
-    dialog.prompt({
-      title: t.card?.enterPasswd || 'Enter password',
-      okText: shouldLockNotes
-        ? t.card?.lock || 'Lock'
-        : t.card?.unlock || 'Unlock',
-      cancelText: t.card?.cancel || 'Cancel',
-      placeholder: t.card?.password || 'Password',
-      onConfirm: async (password) => {
-        const isValid = await passwordStore.isValidPassword(password);
-        if (!isValid) {
-          dialog.alert({
-            title: t.settings?.alertTitle || 'Alert',
-            body: t.card?.wrongPasswd || 'Wrong password.',
-            okText: t.dialog?.close || 'Close',
-          });
-          return;
-        }
-
-        try {
-          if (shouldLockNotes) {
-            for (const note of selectedNotes.value) {
-              if (!note.isLocked) {
-                await noteStore.lockNote(note.id, password);
-              }
-            }
-          } else {
-            for (const note of selectedNotes.value) {
-              if (note.isLocked) {
-                await noteStore.unlockNote(note.id, password);
-              }
-            }
+    try {
+      if (shouldLockNotes) {
+        for (const note of selectedNotes.value) {
+          if (!note.isLocked) {
+            await noteStore.lockNote(note.id);
           }
-          clearSelection();
-        } catch {
-          dialog.alert({
-            title: t.settings?.alertTitle || 'Alert',
-            body: t.card?.wrongPasswd || 'Wrong password.',
-            okText: t.dialog?.close || 'Close',
-          });
         }
-      },
-    });
+      } else {
+        for (const note of selectedNotes.value) {
+          if (note.isLocked) {
+            await noteStore.unlockNote(note.id);
+          }
+        }
+      }
+      clearSelection();
+    } catch (err) {
+      console.error('Failed to toggle lock:', err);
+    }
   }
 
   async function toggleBookmark() {
@@ -231,10 +180,12 @@ export function useSelectionBar() {
     shouldArchive,
     shouldBookmark,
     shouldLock,
+    showCustomize,
     syncSelection,
     clearSelection,
     deleteSelection,
     moveSelection,
+    customizeSelection,
     toggleArchive,
     toggleLock,
     toggleBookmark,

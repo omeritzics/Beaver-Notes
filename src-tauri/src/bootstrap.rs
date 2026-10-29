@@ -1,5 +1,7 @@
 use std::{
+    borrow::Cow,
     fs,
+    io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -22,8 +24,40 @@ const WINDOW_STATE_KEY: &str = "windowStateMain";
 #[cfg(desktop)]
 const LEGACY_DATA_FILES: &[&str] = &["config.json", "data.json"];
 
-#[cfg(desktop)]
-const COLLECTION_NAMESPACES: &[&str] = &["notes", "folders"];
+/// Progress payload for the `migration-progress` Tauri event; `done`/`total`
+/// count files (store JSON + assets), the renderer maps phases onto its bar.
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct MigrationProgress {
+    pub(crate) phase: String,
+    pub(crate) done: u64,
+    pub(crate) total: u64,
+}
+
+fn emit_migration_progress(app: &AppHandle, phase: &str, done: u64, total: u64) {
+    let _ = app.emit(
+        "migration-progress",
+        MigrationProgress {
+            phase: phase.to_string(),
+            done,
+            total,
+        },
+    );
+}
+
+fn count_files(dir: &std::path::Path) -> u64 {
+    let mut n = 0u64;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                n += count_files(&p);
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
+}
 
 pub(crate) fn queue_or_emit_file_open(app: &AppHandle, state: &AppState, path: String) {
     grant_trusted_path(state, Path::new(&path));
@@ -65,7 +99,8 @@ pub(crate) fn focus_main_window(app: &AppHandle) {
 #[cfg(desktop)]
 fn load_window_state(app: &AppHandle, state: &AppState) -> Option<WindowStateSnapshot> {
     let pool = settings_pool(app, state).ok()?;
-    let raw = crate::db::db_get(&pool, WINDOW_STATE_KEY).ok()??;
+    let enc_key = kv_encryption_key(state).ok().flatten();
+    let raw = crate::db::db_get(&pool, WINDOW_STATE_KEY, enc_key).ok()??;
     serde_json::from_str(&raw).ok()
 }
 
@@ -75,19 +110,26 @@ fn save_window_state(app: &AppHandle, state: &AppState) -> Result<(), AppError> 
         return Ok(());
     };
 
-    let position = window.outer_position().map_err(|e| AppError::Other(e.to_string()))?;
-    let size = window.outer_size().map_err(|e| AppError::Other(e.to_string()))?;
+    let position = window
+        .outer_position()
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    let size = window
+        .outer_size()
+        .map_err(|e| AppError::Other(e.to_string()))?;
     let snapshot = WindowStateSnapshot {
         x: position.x,
         y: position.y,
         width: size.width,
         height: size.height,
-        maximized: window.is_maximized().map_err(|e| AppError::Other(e.to_string()))?,
+        maximized: window
+            .is_maximized()
+            .map_err(|e| AppError::Other(e.to_string()))?,
     };
 
     let pool = settings_pool(app, state)?;
+    let enc_key = kv_encryption_key(state).ok().flatten();
     let serialized = serde_json::to_string(&json!(snapshot))?;
-    crate::db::db_set(&pool, WINDOW_STATE_KEY, &serialized)?;
+    crate::db::db_set(&pool, WINDOW_STATE_KEY, &serialized, enc_key)?;
     Ok(())
 }
 
@@ -158,163 +200,90 @@ pub(crate) fn legacy_store_dir(app: &AppHandle) -> Option<PathBuf> {
 }
 
 #[cfg(desktop)]
-fn merge_json_preserving_target(target: &mut serde_json::Value, source: serde_json::Value) {
-    match (target, source) {
-        (serde_json::Value::Object(target_map), serde_json::Value::Object(source_map)) => {
-            for (key, source_value) in source_map {
-                if let Some(target_value) = target_map.get_mut(&key) {
-                    merge_json_preserving_target(target_value, source_value);
-                } else {
-                    target_map.insert(key, source_value);
-                }
-            }
-        }
-        _ => {
-            // Keep the current Tauri-side value. Migration must not overwrite newer data.
-        }
-    }
-}
-
-#[cfg(desktop)]
-fn merge_store_file(source_path: &Path, target_path: &Path) -> Result<(), AppError> {
-    if !source_path.exists() {
-        return Ok(());
-    }
-
-    if !target_path.exists() {
-        fs::copy(source_path, target_path)?;
-        return Ok(());
-    }
-
-    let source_text = fs::read_to_string(source_path)?;
-    let target_text = fs::read_to_string(target_path)?;
-    let source_json = serde_json::from_str::<serde_json::Value>(&source_text)?;
-    let mut target_json =
-        serde_json::from_str::<serde_json::Value>(&target_text)?;
-
-    merge_json_preserving_target(&mut target_json, source_json);
-
-    let serialized = serde_json::to_string_pretty(&target_json)?;
-    fs::write(target_path, format!("{serialized}\n"))?;
-    Ok(())
-}
-
-#[cfg(desktop)]
-fn import_json_file_into_pool(
-    state: &AppState,
-    path: &Path,
-    pool: &crate::db::DbPool,
-) -> Result<bool, AppError> {
+fn import_json_file_into_pool(path: &Path, pool: &crate::db::DbPool) -> Result<bool, AppError> {
     if !path.exists() {
+        crate::rs_log!(
+            "[migration] import_json_file_into_pool: source missing: {}",
+            path.display()
+        );
         return Ok(false);
     }
     let text = fs::read_to_string(path)?;
     let json: serde_json::Value = serde_json::from_str(&text)?;
     let Some(map) = json.as_object() else {
+        crate::rs_log!(
+            "[migration] import_json_file_into_pool: not a JSON object: {}",
+            path.display()
+        );
         return Ok(false);
     };
-    let encrypt = state.crypto.session.read()?.active;
+    crate::rs_log!(
+        "[migration] import_json_file_into_pool: {} top-level keys: {:?}",
+        path.display(),
+        map.keys().collect::<Vec<_>>()
+    );
     for (key, value) in map {
-        if COLLECTION_NAMESPACES.contains(&key.as_str()) {
-            if let Some(items) = value.as_object() {
-                for (id, item) in items {
-                    let flat_key = format!("{}.{}", key, id);
-                    if !crate::db::db_has(pool, &flat_key)? {
-                        let row = if encrypt {
-                            crate::shared::encrypt_note_row_for_storage(
-                                state,
-                                &flat_key,
-                                item.clone(),
-                            )?
-                        } else {
-                            item.clone()
-                        };
-                        crate::db::db_set(
-                            pool,
-                            &flat_key,
-                            &serde_json::to_string(&row)?,
-                        )?;
-                    }
-                }
-                continue;
-            }
-        }
         if !crate::db::db_has(pool, key)? {
-            crate::db::db_set(pool, key, &serde_json::to_string(value)?)?;
+            // Legacy import runs pre-vault: source data is plaintext anyway.
+            crate::db::db_set(pool, key, &serde_json::to_string(value)?, None)?;
+        }
+    }
+
+    // Notes/folders convert to Yjs in frontend, not KV rows. Only scalar keys (labels, etc.) land here.
+    match crate::db::db_all(pool, None) {
+        Ok(rows) => {
+            let notes = rows.keys().filter(|k| k.starts_with("notes.")).count();
+            let folders = rows.keys().filter(|k| k.starts_with("folders.")).count();
+            crate::rs_log!(
+                "[migration] import_json_file_into_pool: {} done — KV now has {} notes, {} folders (both expected to be 0), {} total rows",
+                path.display(),
+                notes,
+                folders,
+                rows.len()
+            );
+        }
+        Err(e) => {
+            crate::rs_log!("[migration] import_json_file_into_pool: post-import summary failed: {e}")
         }
     }
     Ok(true)
 }
 
 #[cfg(desktop)]
-fn copy_directory_missing(source: &Path, target: &Path) -> Result<(), AppError> {
+fn copy_directory_missing(
+    app: &AppHandle,
+    state: &AppState,
+    source: &Path,
+    target: &Path,
+    done: &mut u64,
+    total: u64,
+) -> Result<(), AppError> {
     fs::create_dir_all(target)?;
 
+    let mut last_pct = u64::MAX;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
 
         if source_path.is_dir() {
-            copy_directory_missing(&source_path, &target_path)?;
+            copy_directory_missing(app, state, &source_path, &target_path, done, total)?;
         } else if !target_path.exists() {
-            fs::copy(&source_path, &target_path)?;
+            let raw = fs::read(&source_path)?;
+            let payload = encrypt_asset(app, state, &target_path, &raw)?;
+            fs::write(&target_path, payload)?;
+            *done += 1;
+            // Emit at most once per percentage point so large trees don't flood the channel.
+            let pct = if total > 0 {
+                (*done * 100) / total
+            } else {
+                100
+            };
+            if pct != last_pct {
+                last_pct = pct;
+                emit_migration_progress(app, "copy", *done, total);
+            }
         }
-    }
-
-    Ok(())
-}
-
-#[cfg(desktop)]
-fn import_legacy_auth_blobs(app: &AppHandle, auth_path: &Path) -> Result<(), AppError> {
-    if !auth_path.exists() {
-        return Ok(());
-    }
-
-    let auth_text = fs::read_to_string(auth_path)?;
-    let auth_json = serde_json::from_str::<serde_json::Value>(&auth_text)?;
-    let Some(auth_map) = auth_json.as_object() else {
-        return Ok(());
-    };
-
-    let legacy_blob_map = auth_map.get("blobs").and_then(|value| value.as_object());
-
-    let state = app.state::<AppState>();
-    for key in ALLOWED_BLOB_KEYS {
-        let Some(blob) = auth_map
-            .get(*key)
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                legacy_blob_map
-                    .and_then(|blob_map| blob_map.get(*key))
-                    .and_then(|value| value.as_str())
-            })
-        else {
-            continue;
-        };
-
-        let has_existing = state
-            .cache.secure_blobs
-            .fetch_blob(state.inner(), key)
-            .ok()
-            .flatten()
-            .and_then(|value| String::from_utf8(value).ok())
-            .filter(|value: &String| !value.is_empty())
-            .is_some()
-            || keyring_entry(key)
-                .ok()
-                .and_then(|entry| entry.get_password().ok())
-                .filter(|value: &String| !value.is_empty())
-                .is_some();
-
-        if has_existing {
-            continue;
-        }
-
-        let _ = state
-            .cache.secure_blobs
-            .store_blob(state.inner(), key, blob.as_bytes().to_vec());
-        let _ = keyring_entry(key).and_then(|entry| entry.set_password(blob).map_err(|e| AppError::Other(e.to_string())));
     }
 
     Ok(())
@@ -328,7 +297,7 @@ pub(crate) fn dir_has_any_legacy_content(path: &Path) -> bool {
         || [SETTINGS_STORE, AUTH_STORE]
             .iter()
             .any(|name| path.join(name).exists())
-        || ["notes-assets", "file-assets"]
+        || ["notes-assets", "file-assets", "assets"]
             .iter()
             .any(|name| path.join(name).exists())
 }
@@ -365,60 +334,113 @@ fn run_migration_core(
     let new_dir = crate::shared::app_storage_dir(app, state)?;
     let marker = new_dir.join(".legacy-store-migrated");
 
+    crate::rs_log!("[migration] run_migration_core: start");
+    crate::rs_log!("[migration]   legacy dir: {}", old_dir.display());
+    crate::rs_log!("[migration]   target dir: {}", new_dir.display());
+    crate::rs_log!("[migration]   legacy exists: {}", old_dir.exists());
+    crate::rs_log!(
+        "[migration]   legacy files: config.json={}, data.json={}",
+        old_dir.join("config.json").exists(),
+        old_dir.join("data.json").exists()
+    );
+
     fs::create_dir_all(&new_dir)?;
 
     let mut merged_store_files = Vec::new();
     let data_pool = data_pool(app, state)?;
-    for legacy_name in LEGACY_DATA_FILES {
-        let old = old_dir.join(legacy_name);
-        if import_json_file_into_pool(state, &old, &data_pool)? {
-            merged_store_files.push((*legacy_name).to_string());
+
+    // Count files for progress total. Legacy config/data notes/folders convert straight to Yjs in frontend.
+    crate::rs_log!(
+        "[migration]   skipping legacy notes/folders import (config.json/data.json) — the data KV store stays empty of note rows"
+    );
+    let mut copy_total = 1; // SETTINGS_STORE
+    for folder in ["notes-assets", "file-assets"] {
+        let old = old_dir.join(folder);
+        if old.exists() {
+            copy_total += count_files(&old);
         }
     }
-
-    let old_auth = old_dir.join(AUTH_STORE);
-    if old_auth.exists() {
-        merge_store_file(&old_auth, &new_dir.join(AUTH_STORE))?;
-        merged_store_files.push(AUTH_STORE.to_string());
+    let old_assets = old_dir.join("assets");
+    if old_assets.exists() {
+        for entry in fs::read_dir(&old_assets)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "notes-assets" || name_str == "file-assets" {
+                continue;
+            }
+            let src = entry.path();
+            copy_total += if src.is_dir() { count_files(&src) } else { 1 };
+        }
     }
+    let mut copy_done = 0u64;
 
     let settings_pool = settings_pool(app, state)?;
     let old_settings = old_dir.join(SETTINGS_STORE);
-    if import_json_file_into_pool(state, &old_settings, &settings_pool)? {
+    if import_json_file_into_pool(&old_settings, &settings_pool)? {
         merged_store_files.push(SETTINGS_STORE.to_string());
     }
-
-    const SETTINGS_KEY_REMAP: &[(&str, &str)] = &[
-        ("color-scheme", "colorScheme"),
-        ("selected-font", "selectedFont"),
-        ("selected-font-code", "selectedCodeFont"),
-        ("selected-dark-text", "selectedDarkText"),
-        ("visibility-menubar", "visibilityMenubar"),
-        ("advanced-settings", "advancedSettings"),
-    ];
-    for (old_key, new_key) in SETTINGS_KEY_REMAP {
-        if crate::db::db_has(&settings_pool, new_key)? {
-            continue; // canonical key already present – don't overwrite
-        }
-        if let Some(value) = crate::db::db_get(&settings_pool, old_key)? {
-            crate::db::db_set(&settings_pool, new_key, &value)?;
-        }
-    }
+    copy_done += 1;
+    emit_migration_progress(app, "copy", copy_done, copy_total);
 
     let mut copied_asset_dirs = Vec::new();
     for folder in ["notes-assets", "file-assets"] {
         let old = old_dir.join(folder);
         if old.exists() {
-            copy_directory_missing(&old, &new_dir.join(folder))?;
+            // Copy into the consolidated `assets/` directory
+            let dest = new_dir.join("assets");
+            copy_directory_missing(app, state, &old, &dest, &mut copy_done, copy_total)?;
             copied_asset_dirs.push(folder.to_string());
         }
     }
+    // Copy consolidated assets dir, skip nested notes-assets/file-assets (already handled, avoids duplicates).
+    if old_assets.exists() {
+        let dest_assets = new_dir.join("assets");
+        fs::create_dir_all(&dest_assets)?;
+        for entry in fs::read_dir(&old_assets)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "notes-assets" || name_str == "file-assets" {
+                continue;
+            }
+            let src = entry.path();
+            let dst = dest_assets.join(&name);
+            if src.is_dir() {
+                copy_directory_missing(app, state, &src, &dst, &mut copy_done, copy_total)?;
+            } else if !dst.exists() {
+                let raw = fs::read(&src)?;
+                let payload = encrypt_asset(app, state, &dst, &raw)?;
+                fs::write(&dst, payload)?;
+                copy_done += 1;
+                emit_migration_progress(app, "copy", copy_done, copy_total);
+            }
+        }
+        copied_asset_dirs.push("assets".to_string());
+    }
 
-    let _ = import_legacy_auth_blobs(app, &old_dir.join(AUTH_STORE));
+    // Non-destructive while migration tested: never remove legacy Electron dir here.
 
-    // Intentionally non-destructive while migration is being tested.
-    // Do not remove or mutate the legacy Electron directory here.
-    // let _ = fs::remove_dir_all(&old_dir);
+    // Final KV summary before marker: data store has no legacy note rows (frontend converts to Yjs).
+    match crate::db::db_all(&data_pool, None) {
+        Ok(rows) => {
+            let notes = rows.keys().filter(|k| k.starts_with("notes.")).count();
+            let folders = rows.keys().filter(|k| k.starts_with("folders.")).count();
+            crate::rs_log!(
+                "[migration] run_migration_core: DONE — data store has {} notes, {} folders (both expected to be 0), {} total rows",
+                notes,
+                folders,
+                rows.len()
+            );
+        }
+        Err(e) => crate::rs_log!("[migration] run_migration_core: post-import summary failed: {e}"),
+    }
+    crate::rs_log!(
+        "[migration] run_migration_core: writing marker {} — files merged: {:?}, asset dirs: {:?}",
+        marker.display(),
+        merged_store_files,
+        copied_asset_dirs
+    );
 
     fs::write(&marker, b"ok")?;
 
@@ -479,109 +501,168 @@ pub(crate) fn run_legacy_store_data_migration_from_path(
 }
 
 pub(crate) fn register_asset_protocols(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
-    builder
-        .register_asynchronous_uri_scheme_protocol("assets", move |ctx, request, responder| {
-            let app = ctx.app_handle().clone();
-            let path = match resolve_asset_path_from_protocol_url(
-                &app,
-                request.uri().to_string().as_str(),
-                "assets",
-            ) {
-                Ok(path) => path,
-                Err(_) => {
-                    responder.respond(protocol_response(
-                        StatusCode::BAD_REQUEST,
-                        Path::new("asset.bin"),
-                        Vec::new(),
-                    ));
-                    return;
-                }
-            };
-            let (asset_cache_dir, transient_passphrase) = {
-                let state = app.state::<AppState>();
-                let transient_passphrase = state
-                    .security.transient_passphrase
-                    .lock()
-                    .ok()
-                    .map(|value| value.clone())
-                    .filter(|value| !value.is_empty());
-                (state.files.asset_cache_dir.clone(), transient_passphrase)
-            };
-            std::thread::spawn(move || {
-                let response = match cached_or_decrypted_asset(
-                    &app,
-                    &asset_cache_dir,
-                    transient_passphrase.as_deref(),
-                    &path,
-                )
-                .and_then(|resolved| {
-                    fs::read(&resolved)
-                        .map_err(|e| AppError::Other(e.to_string()))
-                        .map(|bytes| (resolved, bytes))
-                }) {
-                    Ok((resolved, bytes)) => protocol_response(StatusCode::OK, &resolved, bytes),
-                    Err(_) => protocol_response(StatusCode::NOT_FOUND, &path, Vec::new()),
-                };
-                responder.respond(response);
-            });
-        })
-        .register_asynchronous_uri_scheme_protocol("file-assets", move |ctx, request, responder| {
-            let app = ctx.app_handle().clone();
-            let path = match resolve_asset_path_from_protocol_url(
-                &app,
-                request.uri().to_string().as_str(),
-                "file-assets",
-            ) {
-                Ok(path) => path,
-                Err(_) => {
-                    responder.respond(protocol_response(
-                        StatusCode::BAD_REQUEST,
-                        Path::new("asset.bin"),
-                        Vec::new(),
-                    ));
-                    return;
-                }
-            };
-            let (asset_cache_dir, transient_passphrase) = {
-                let state = app.state::<AppState>();
-                let transient_passphrase = state
-                    .security.transient_passphrase
-                    .lock()
-                    .ok()
-                    .map(|value| value.clone())
-                    .filter(|value| !value.is_empty());
-                (state.files.asset_cache_dir.clone(), transient_passphrase)
-            };
-            std::thread::spawn(move || {
-                let response = match cached_or_decrypted_asset(
-                    &app,
-                    &asset_cache_dir,
-                    transient_passphrase.as_deref(),
-                    &path,
-                )
-                .and_then(|resolved| {
-                    fs::read(&resolved)
-                        .map_err(|e| AppError::Other(e.to_string()))
-                        .map(|bytes| (resolved, bytes))
-                }) {
-                    Ok((resolved, bytes)) => protocol_response(StatusCode::OK, &resolved, bytes),
-                    Err(_) => protocol_response(StatusCode::NOT_FOUND, &path, Vec::new()),
-                };
-                responder.respond(response);
-            });
-        })
+    register_asset_protocol(register_asset_protocol(builder, "assets"), "file-assets")
 }
 
-/// Migrate flat data.db and settings.db into the workspaces layout.
-/// Moves `data.db` → `workspaces/default/data.db` and
-/// `settings.db` → `workspaces/default/settings.db`.
-/// Creates `workspaces.json` at the app root with the default workspace.
+fn register_asset_protocol(
+    builder: tauri::Builder<Wry>,
+    scheme: &'static str,
+) -> tauri::Builder<Wry> {
+    builder.register_asynchronous_uri_scheme_protocol(scheme, move |ctx, request, responder| {
+        let app = ctx.app_handle().clone();
+        let path = match resolve_asset_path_from_protocol_url(
+            &app,
+            request.uri().to_string().as_str(),
+            scheme,
+        ) {
+            Ok(path) => path,
+            Err(_) => {
+                responder.respond(protocol_response(
+                    StatusCode::BAD_REQUEST,
+                    Path::new("asset.bin"),
+                    Vec::new(),
+                ));
+                return;
+            }
+        };
+        let (asset_cache_dir, transient_passphrase) = {
+            let state = app.state::<AppState>();
+            let transient_passphrase = state
+                .security
+                .transient_passphrase
+                .lock()
+                .ok()
+                .map(|value| value.clone())
+                .filter(|value| !value.is_empty());
+            (state.files.asset_cache_dir(), transient_passphrase)
+        };
+        let range = request
+            .headers()
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        std::thread::spawn(move || {
+            let response = serve_asset(
+                &app,
+                &asset_cache_dir,
+                transient_passphrase.as_deref(),
+                &path,
+                range.as_deref(),
+            );
+            responder.respond(response);
+        });
+    })
+}
+
+/// Max bytes for a non-range request, so a full read cannot blow the process
+/// heap. Range requests only ever read their slice.
+const MAX_FULL_READ: u64 = 16 * 1024 * 1024; // 16 MiB
+
+/// Serve a cached-or-decrypted asset honoring HTTP byte ranges: no header =
+/// full file, range = `206` slice so media never forces a whole decrypted asset
+/// into memory, unsatisfiable = `416` with `Content-Range: bytes */N`.
+fn serve_asset(
+    app: &AppHandle,
+    asset_cache_dir: &Path,
+    transient_passphrase: Option<&str>,
+    path: &Path,
+    range: Option<&str>,
+) -> http::Response<Cow<'static, [u8]>> {
+    let _t = crate::shared::speed_log::scope("assets.serve_asset");
+    let resolved = match cached_or_decrypted_asset(app, asset_cache_dir, transient_passphrase, path)
+    {
+        Ok(resolved) => resolved,
+        Err(_) => return protocol_response(StatusCode::NOT_FOUND, path, Vec::new()),
+    };
+    let total = fs::metadata(&resolved).map(|meta| meta.len()).unwrap_or(0);
+    match range
+        .map(|value| parse_byte_range(value, total))
+        .unwrap_or(Ok(None))
+    {
+        Ok(None) => {
+            let to_read = total.min(MAX_FULL_READ);
+            let read_result = (|| -> std::io::Result<Vec<u8>> {
+                let file = fs::File::open(&resolved)?;
+                let mut reader = BufReader::new(file);
+                let mut buf = Vec::with_capacity(to_read as usize);
+                reader.by_ref().take(to_read).read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+            match read_result {
+                Ok(bytes) => protocol_response_with_range(StatusCode::OK, &resolved, bytes, None),
+                Err(_) => protocol_response(StatusCode::NOT_FOUND, path, Vec::new()),
+            }
+        }
+        Ok(Some((start, end))) => {
+            let len = (end - start + 1) as usize;
+            let read = (|| -> std::io::Result<Vec<u8>> {
+                let file = fs::File::open(&resolved)?;
+                let mut reader = BufReader::new(file);
+                reader.seek(SeekFrom::Start(start))?;
+                let mut buf = Vec::with_capacity(len);
+                reader.by_ref().take(len as u64).read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+            match read {
+                Ok(bytes) => protocol_response_with_range(
+                    StatusCode::PARTIAL_CONTENT,
+                    &resolved,
+                    bytes,
+                    Some(format!("bytes {}-{}/{}", start, end, total)),
+                ),
+                Err(_) => protocol_response(StatusCode::NOT_FOUND, path, Vec::new()),
+            }
+        }
+        Err(()) => protocol_response_with_range(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            path,
+            Vec::new(),
+            Some(format!("bytes */{}", total)),
+        ),
+    }
+}
+
+/// Parse a single `Range: bytes=...` header: `Ok(None)` = no range,
+/// `Ok(Some((start, end)))` = satisfiable (inclusive end), `Err(())` = unsatisfiable.
+fn parse_byte_range(header: &str, total: u64) -> Result<Option<(u64, u64)>, ()> {
+    if total == 0 {
+        return Err(());
+    }
+    let spec = header.strip_prefix("bytes=").ok_or(())?;
+    let (start, end) = spec.split_once('-').ok_or(())?;
+    let range = if start.is_empty() {
+        // Suffix range: last `end` bytes.
+        let suffix_len: u64 = end.parse().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        (total.saturating_sub(suffix_len), total - 1)
+    } else {
+        let start: u64 = start.parse().map_err(|_| ())?;
+        if start >= total {
+            return Err(());
+        }
+        if end.is_empty() {
+            (start, total - 1)
+        } else {
+            let end: u64 = end.parse().map_err(|_| ())?;
+            if end < start {
+                return Err(());
+            }
+            (start, end.min(total - 1))
+        }
+    };
+    Ok(Some(range))
+}
+
+/// Move flat data.db/settings.db into `workspaces/default/` and seed workspaces.json.
 fn migrate_to_workspace_layout(app: &AppHandle, state: &AppState) -> Result<(), AppError> {
+    let _t = crate::shared::speed_log::scope("bootstrap.migrate_to_workspace_layout");
     let app_dir = crate::shared::app_storage_dir(app, state)?;
     let ws_root = app_dir.join(crate::shared::WORKSPACES_DIR);
     let marker = app_dir.join(".workspace-migrated");
 
-    // Already migrated — just ensure default workspace is registered
+    // Already migrated: ensure default workspace registered.
     if marker.exists() || ws_root.exists() {
         ensure_default_workspace_in_registry(app, state)?;
         return Ok(());
@@ -593,12 +674,10 @@ fn migrate_to_workspace_layout(app: &AppHandle, state: &AppState) -> Result<(), 
 
     fs::create_dir_all(&default_ws_dir)?;
 
-    // Move existing data.db into the default workspace
     if old_data_db.exists() {
         fs::rename(&old_data_db, default_ws_dir.join("data.db"))?;
     }
 
-    // Move existing settings.db into the default workspace
     if old_settings_db.exists() {
         fs::rename(&old_settings_db, default_ws_dir.join("settings.db"))?;
     }
@@ -609,6 +688,10 @@ fn migrate_to_workspace_layout(app: &AppHandle, state: &AppState) -> Result<(), 
         id: crate::shared::DEFAULT_WORKSPACE_ID.to_string(),
         name: crate::shared::DEFAULT_WORKSPACE_NAME.to_string(),
         created_at: now,
+        workspace_type: "personal".into(),
+        org_id: None,
+        owner_id: None,
+        cloud_sync: false,
     };
     let registry_json = serde_json::json!({
         "activeWorkspace": crate::shared::DEFAULT_WORKSPACE_ID,
@@ -623,20 +706,20 @@ fn migrate_to_workspace_layout(app: &AppHandle, state: &AppState) -> Result<(), 
 }
 
 /// Ensure the default workspace entry exists in workspaces.json.
-fn ensure_default_workspace_in_registry(
-    app: &AppHandle,
-    state: &AppState,
-) -> Result<(), AppError> {
+fn ensure_default_workspace_in_registry(app: &AppHandle, state: &AppState) -> Result<(), AppError> {
     let json_path = crate::shared::workspaces_json_path(app, state)?;
     let has_json = json_path.exists();
 
     if !has_json {
-        // No workspaces.json yet — create one with default
         let now = chrono::Utc::now().to_rfc3339();
         let default_ws = crate::shared::WorkspaceInfo {
             id: crate::shared::DEFAULT_WORKSPACE_ID.to_string(),
             name: crate::shared::DEFAULT_WORKSPACE_NAME.to_string(),
             created_at: now,
+            workspace_type: "personal".into(),
+            org_id: None,
+            owner_id: None,
+            cloud_sync: false,
         };
         let registry_json = serde_json::json!({
             "activeWorkspace": crate::shared::DEFAULT_WORKSPACE_ID,
@@ -647,42 +730,104 @@ fn ensure_default_workspace_in_registry(
         return Ok(());
     }
 
-    // Check if default workspace is registered
     let registry = crate::shared::load_workspace_registry(app, state)?;
-    if !registry.iter().any(|w| w.id == crate::shared::DEFAULT_WORKSPACE_ID) {
+    if !registry
+        .iter()
+        .any(|w| w.id == crate::shared::DEFAULT_WORKSPACE_ID)
+    {
         let now = chrono::Utc::now().to_rfc3339();
         let default_ws = crate::shared::WorkspaceInfo {
             id: crate::shared::DEFAULT_WORKSPACE_ID.to_string(),
             name: crate::shared::DEFAULT_WORKSPACE_NAME.to_string(),
             created_at: now,
+            workspace_type: "personal".into(),
+            org_id: None,
+            owner_id: None,
+            cloud_sync: false,
         };
         let mut new_registry = registry;
         new_registry.push(default_ws);
         crate::shared::save_workspace_registry(app, state, &new_registry)?;
-        crate::shared::save_active_workspace_id(
-            app,
-            state,
-            crate::shared::DEFAULT_WORKSPACE_ID,
-        )?;
+        crate::shared::save_active_workspace_id(app, state, crate::shared::DEFAULT_WORKSPACE_ID)?;
     }
     Ok(())
 }
 
 pub(crate) fn setup_app(app: &mut App<Wry>) -> Result<(), AppError> {
+    let _t = crate::shared::speed_log::scope("bootstrap.setup_app");
     let state = app.state::<AppState>();
 
-    // ── Workspace migration (must run BEFORE any settings_pool call) ──────
+    // Android: std::env::temp_dir() is not app-writable, so the run()-time
+    // scratch dirs abort setup with EACCES. Relocate them under the sandbox
+    // temp dir once the AppHandle exists; desktop keeps the run() values.
+    #[cfg(target_os = "android")]
+    {
+        let base = app
+            .path()
+            .temp_dir()
+            .map_err(|e| AppError::Other(e.to_string()))?;
+        *state
+            .files
+            .asset_cache_dir
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = base.join("beaver-notes-asset-cache");
+        *state
+            .files
+            .external_open_dir
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = base.join("beaver-notes-open");
+    }
+
+    // Workspace migration (must run BEFORE any settings_pool call)
     migrate_to_workspace_layout(app.handle(), state.inner())?;
 
+    // Retired separate app-password store: one workspace passphrase protects
+    // everything now. Delete legacy `password.enc` on first launch; absence is fine.
+    {
+        let app_dir = crate::shared::app_storage_dir(app.handle(), state.inner())?;
+        let legacy_password_file = app_dir.join("password.enc");
+        if legacy_password_file.exists() {
+            let _ = std::fs::remove_file(&legacy_password_file);
+        }
+    }
+
     sync_roots_from_settings(app.handle(), state.inner());
+    // The previous Electron app's data lives outside the sandbox and is never
+    // picked via a dialog, so trust it here — otherwise the onboarding import
+    // trips the fs-access gate on the auto-detected legacy dir.
+    if let Some(legacy) = legacy_store_dir(app.handle()) {
+        if legacy.exists() {
+            grant_trusted_path(&state, &legacy);
+        }
+    }
     grant_trusted_path(
         &state,
         &crate::shared::app_storage_dir(app.handle(), state.inner())?,
     );
-    grant_trusted_path(&state, &app.path().temp_dir().map_err(|e| AppError::Other(e.to_string()))?);
-    fs::create_dir_all(&state.files.asset_cache_dir)?;
+    grant_trusted_path(
+        &state,
+        &app.path()
+            .temp_dir()
+            .map_err(|e| AppError::Other(e.to_string()))?,
+    );
+    fs::create_dir_all(state.files.asset_cache_dir())?;
 
-    *state.updater.lock().map_err(|e| AppError::Other(e.to_string()))? = UpdaterState {
+    // Fold any legacy plaintext `master.key` into the secure chain, then delete; never fails startup.
+    let _ = crate::shared::migrate_legacy_master_key();
+
+    // Warm Keychain master key in background so first load hits cache, not 2.5s cold read.
+    // Skipped on daemon-less Linux so frontend prompts for device password before ephemeral mint.
+    if crate::shared::durable_store_available() {
+        std::thread::spawn(|| {
+            let _ = read_master_key();
+        });
+    }
+    prewarm_crypto();
+
+    *state
+        .updater
+        .lock()
+        .map_err(|e| AppError::Other(e.to_string()))? = UpdaterState {
         auto_update_enabled: commands::updates::load_auto_update_enabled(app.handle())
             .unwrap_or(true),
         current_version: Some(app.package_info().version.to_string()),
@@ -691,7 +836,8 @@ pub(crate) fn setup_app(app: &mut App<Wry>) -> Result<(), AppError> {
     #[cfg(desktop)]
     {
         let menu = menu::build_app_menu(app.handle())?;
-        app.set_menu(menu).map_err(|e| AppError::Other(e.to_string()))?;
+        app.set_menu(menu)
+            .map_err(|e| AppError::Other(e.to_string()))?;
         if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
             restore_window_state(app.handle(), state.inner())?;
             let app_handle = app.handle().clone();
@@ -747,4 +893,85 @@ pub(crate) fn setup_app(app: &mut App<Wry>) -> Result<(), AppError> {
         s.active = manifest_path.exists();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_absent_returns_none() {
+        assert_eq!(parse_byte_range("", 100), Err(()));
+        assert_eq!(parse_byte_range("garbage", 100), Err(()));
+    }
+
+    #[test]
+    fn range_full_file() {
+        assert_eq!(parse_byte_range("bytes=0-", 100), Ok(Some((0, 99))));
+        assert_eq!(parse_byte_range("bytes=0-99", 100), Ok(Some((0, 99))));
+    }
+
+    #[test]
+    fn range_middle_slice() {
+        assert_eq!(parse_byte_range("bytes=10-20", 100), Ok(Some((10, 20))));
+    }
+
+    #[test]
+    fn range_open_ended_clamps_to_length() {
+        assert_eq!(parse_byte_range("bytes=90-999", 100), Ok(Some((90, 99))));
+    }
+
+    #[test]
+    fn range_suffix() {
+        assert_eq!(parse_byte_range("bytes=-25", 100), Ok(Some((75, 99))));
+        assert_eq!(parse_byte_range("bytes=-0", 100), Err(()));
+    }
+
+    #[test]
+    fn range_unsatisfiable() {
+        assert_eq!(parse_byte_range("bytes=100-", 100), Err(()));
+        assert_eq!(parse_byte_range("bytes=100-200", 100), Err(()));
+        assert_eq!(parse_byte_range("bytes=20-10", 100), Err(()));
+        assert_eq!(parse_byte_range("bytes=0-", 0), Err(()));
+    }
+
+    #[cfg(desktop)]
+    mod desktop_migration_tests {
+        use super::*;
+        use std::time::SystemTime;
+
+        fn unique_temp_dir(prefix: &str) -> PathBuf {
+            let ts = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock ok")
+                .as_nanos();
+            std::env::temp_dir().join(format!("{prefix}-{ts}-{}", std::process::id()))
+        }
+
+        #[test]
+        fn import_json_ignores_notes_collection() {
+            use std::io::Write;
+            let root = unique_temp_dir("beaver-notes-nocoll");
+            let _ = fs::create_dir_all(&root);
+            let db_path = root.join("data.db");
+            let pool = crate::db::open_pool(&db_path).expect("pool");
+
+            let fixture = root.join("config.json");
+            let mut f = fs::File::create(&fixture).expect("create");
+            write!(
+                f,
+                r#"{{"notes": {{"n1": {{"id":"n1","title":"T"}}}}, "folders": {{"f1": {{"id":"f1"}}}}, "labels": ["a"]}}"#
+            )
+            .expect("write");
+
+            let imported = import_json_file_into_pool(&fixture, &pool).expect("import");
+            assert!(imported);
+            let rows = crate::db::db_all(&pool, None).expect("rows");
+            assert!(rows
+                .keys()
+                .all(|k| !k.starts_with("notes.") && !k.starts_with("folders.")));
+            assert!(rows.contains_key("labels"));
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
 }

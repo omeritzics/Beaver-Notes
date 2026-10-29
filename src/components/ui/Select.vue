@@ -3,34 +3,36 @@
     <label
       v-if="label"
       :for="selectId"
-      class="text-neutral-200 text-sm ml-2 rtl:ml-0 rtl:mr-2"
+      :id="`${selectId}-label`"
+      class="text-neutral-600 dark:text-neutral-200 text-sm ltr:ml-2 rtl:mr-2"
     >
       {{ label }}
     </label>
 
     <div
-      class="ui-select__content flex items-center w-full block transition focus-within:ring-1 ring-secondary bg-input rounded-lg appearance-none focus:outline-none relative"
+      :class="[
+        'ui-select__content flex items-center w-full transition focus-within:ring-1 ring-secondary bg-input appearance-none focus:outline-none relative',
+        radiusClass,
+      ]"
     >
-      <!-- Prepend icon -->
       <v-remixicon
         v-if="prependIcon"
         :name="prependIcon"
-        class="absolute text-neutral-600 dark:text-neutral-200 left-0 ml-2 rtl:left-auto rtl:right-0 rtl:mr-2 rtl:ml-0"
+        class="absolute text-neutral-600 dark:text-neutral-200 ltr:left-0 rtl:right-0 ltr:ml-2 rtl:mr-2"
       />
 
-      <!-- Custom Select Button -->
       <button
         :id="selectId"
         ref="selectButton"
         :class="[
-          prependIcon ? 'pl-8 rtl:pl-0 rtl:pr-8' : '',
-          'px-4 pr-8 py-2 z-10 w-full h-full text-left rtl:text-right bg-transparent focus:outline-none',
+          prependIcon ? 'ltr:pl-8 rtl:pr-8' : '',
+          'px-4 ltr:pr-8 rtl:pl-8 py-2 z-10 w-full h-full ltr:text-left rtl:text-right bg-transparent focus:outline-none',
         ]"
         type="button"
         :aria-labelledby="label ? `${selectId}-label` : undefined"
         :aria-haspopup="true"
         :aria-expanded="isOpen"
-        @click="toggle"
+        @click="toggle(false)"
         @keydown="onKeydown"
         @blur="handleBlur"
       >
@@ -42,88 +44,116 @@
         </span>
       </button>
 
-      <!-- Dropdown Arrow (rotate only when open, not for RTL) -->
       <v-remixicon
         name="riArrowDownSLine"
         :class="{ 'rotate-180': isOpen }"
-        class="absolute right-2 rtl:right-auto rtl:left-2 top-1/2 -translate-y-1/2 text-neutral-600 dark:text-neutral-200 transition-transform duration-200 pointer-events-none"
+        class="absolute ltr:right-2 rtl:left-2 top-1/2 -translate-y-1/2 text-neutral-600 dark:text-neutral-200 transition-transform duration-200 pointer-events-none"
       />
 
-      <!-- Dropdown Menu -->
-      <Transition
-        enter-active-class="transition duration-200 ease-[var(--ease-standard)]"
-        enter-from-class="opacity-0 scale-95"
-        enter-to-class="opacity-100 scale-100"
-        leave-active-class="transition duration-150 ease-out"
-        leave-from-class="opacity-100 scale-100"
-        leave-to-class="opacity-0 scale-95"
-      >
-        <div
-          v-if="isOpen"
-          ref="dropdown"
-          class="absolute top-full left-0 right-0 mt-1 bg-white dark:bg-neutral-900 border rounded-xl shadow-xl z-50 p-1.5 origin-top"
-          role="listbox"
-          :aria-activedescendant="focusedIndex >= 0 ? `${selectId}-option-${focusedIndex}` : undefined"
+      <Teleport to="body">
+        <Transition
+          :enter-active-class="
+            openedViaKeyboard
+              ? 'transition-none'
+              : 'transition duration-150 ease-out motion-reduce:transition-none'
+          "
+          enter-from-class="opacity-0 scale-95"
+          enter-to-class="opacity-100 scale-100"
+          leave-active-class="transition duration-150 ease-out motion-reduce:transition-none"
+          leave-from-class="opacity-100 scale-100"
+          leave-to-class="opacity-0 scale-95"
         >
-          <!-- Search Input -->
-          <div v-if="search" class="mb-2">
-            <ui-input
-              ref="searchInput"
-              v-model="searchQuery"
-              type="text"
-              :placeholder="translations.index.search"
-              class="w-full"
-              @keydown="onSearchKeydown"
-            />
+          <div
+            v-show="isOpen"
+            ref="dropdown"
+            :style="floatingStyles"
+            :class="[
+              'bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl z-50 p-1.5 box-border flex flex-col min-w-0',
+              radiusClass,
+              originClass,
+              menuClass,
+            ]"
+            role="listbox"
+            :aria-activedescendant="
+              focusedIndex >= 0
+                ? `${selectId}-option-${focusedIndex}`
+                : undefined
+            "
+          >
+            <div v-if="search" class="mb-2 w-full min-w-0">
+              <ui-input
+                ref="searchInput"
+                v-model="searchQuery"
+                type="text"
+                :placeholder="translations.index?.search || 'Search...'"
+                class="w-full box-border max-w-full"
+                @keydown="onSearchKeydown"
+                radius="lg"
+              />
+            </div>
+
+            <div class="max-h-48 overflow-y-auto space-y-0.5 min-w-0">
+              <div
+                v-if="placeholder && !hideePlaceholderInDropdown"
+                class="p-1.5 rounded-lg hoverable transition-colors truncate cursor-pointer"
+                :class="{
+                  'bg-primary bg-opacity-10 text-primary dark:bg-secondary dark:bg-opacity-10 dark:text-secondary':
+                    modelValue === '',
+                  'text-neutral-500': modelValue !== '',
+                }"
+                :title="placeholder"
+                @click="select({ value: '', text: placeholder })"
+              >
+                {{ placeholder }}
+              </div>
+
+              <div
+                v-for="(option, index) in filteredOptions"
+                :key="`${option.value}-${index}`"
+                :ref="(el) => setOptionRef(el, index)"
+                :id="`${selectId}-option-${index}`"
+                class="p-1.5 rounded-lg hoverable transition-colors truncate cursor-pointer"
+                role="option"
+                :title="option.text"
+                :aria-selected="option.value === String(modelValue)"
+                :class="{
+                  'bg-primary bg-opacity-10 text-primary dark:bg-secondary dark:bg-opacity-10 dark:text-secondary':
+                    option.value === String(modelValue),
+                  'bg-neutral-100 dark:bg-neutral-700':
+                    option.value !== String(modelValue) &&
+                    index === focusedIndex &&
+                    !option.disabled,
+                  'opacity-50 cursor-not-allowed': option.disabled,
+                }"
+                @click="select(option)"
+              >
+                {{ option.text }}
+              </div>
+
+              <div
+                v-if="search && searchQuery && filteredOptions.length === 0"
+                class="p-1.5 rounded-lg text-neutral-500 text-center text-sm"
+              >
+                {{ translations.index?.notFound || 'No options found' }}
+              </div>
+            </div>
           </div>
-
-          <!-- Options -->
-          <div class="max-h-48 overflow-y-auto space-y-0.5">
-            <div
-              v-if="placeholder && !hideePlaceholderInDropdown"
-              class="p-1.5 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-700 text-neutral-500 transition-colors"
-              :class="{
-                'bg-neutral-100 dark:bg-neutral-700': modelValue === '',
-              }"
-              @click="select({ value: '', text: placeholder })"
-            >
-              {{ placeholder }}
-            </div>
-
-            <div
-              v-for="(option, index) in filteredOptions"
-              :key="`${option.value}-${index}`"
-              :ref="(el) => setOptionRef(el, index)"
-              :id="`${selectId}-option-${index}`"
-              class="p-1.5 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-700 transition-colors"
-              role="option"
-              :aria-selected="option.value === String(modelValue)"
-              :class="{
-                'bg-neutral-100 dark:bg-neutral-700':
-                  option.value === String(modelValue) ||
-                  (index === focusedIndex && !option.disabled),
-                'opacity-50 cursor-not-allowed': option.disabled,
-              }"
-              @click="select(option)"
-            >
-              {{ option.text }}
-            </div>
-
-            <div
-              v-if="search && searchQuery && filteredOptions.length === 0"
-              class="p-1.5 rounded-lg text-neutral-500 text-center"
-            >
-              {{ translations.index?.notFound || 'No options found' }}
-            </div>
-          </div>
-        </div>
-      </Transition>
+        </Transition>
+      </Teleport>
     </div>
   </div>
 </template>
 
 <script>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
+import {
+  useFloating,
+  offset,
+  flip,
+  shift,
+  size,
+  autoUpdate,
+} from '@floating-ui/vue';
 import { useTranslations } from '@/composable/useTranslations';
 import { useScrollLock } from '@/utils/ui/scrollLock.js';
 
@@ -139,9 +169,17 @@ export default {
       type: Boolean,
       default: false,
     },
+    menuClass: {
+      type: [String, Object, Array],
+      default: '',
+    },
     options: {
       type: Array,
       default: () => [],
+    },
+    radius: {
+      type: String,
+      default: 'xl',
     },
   },
   emits: ['update:modelValue', 'change'],
@@ -156,6 +194,25 @@ export default {
     const optionRefs = ref([]);
     const { translations } = useTranslations();
 
+    const { floatingStyles, placement } = useFloating(selectButton, dropdown, {
+      placement: 'bottom-start',
+      middleware: [
+        offset(6),
+        flip(),
+        shift({ padding: 8 }),
+        size({
+          apply({ rects, availableWidth, availableHeight, elements }) {
+            Object.assign(elements.floating.style, {
+              minWidth: `${Math.max(180, rects.reference.width)}px`,
+              maxWidth: `${Math.min(320, availableWidth - 16)}px`,
+              maxHeight: `${Math.min(260, availableHeight - 16)}px`,
+            });
+          },
+        }),
+      ],
+      whileElementsMounted: autoUpdate,
+    });
+
     const setOptionRef = (el, index) => {
       if (el) {
         optionRefs.value[index] = el;
@@ -168,7 +225,7 @@ export default {
         const focusedElement = optionRefs.value[newIndex];
         if (focusedElement && focusedElement.scrollIntoView) {
           focusedElement.scrollIntoView({
-            block: 'center',
+            block: 'nearest',
             behavior: 'smooth',
           });
         }
@@ -180,7 +237,7 @@ export default {
         return props.options.map((opt) =>
           typeof opt === 'string'
             ? { value: opt, text: opt, disabled: false }
-            : { disabled: false, ...opt }
+            : { disabled: false, ...opt },
         );
       }
 
@@ -213,20 +270,29 @@ export default {
 
       const query = searchQuery.value.toLowerCase();
       return allOptions.value.filter((opt) =>
-        opt.text.toLowerCase().includes(query)
+        opt.text.toLowerCase().includes(query),
       );
     });
 
     const selectedText = computed(() => {
       const option = allOptions.value.find(
-        (opt) => opt.value === String(props.modelValue)
+        (opt) => opt.value === String(props.modelValue),
       );
       return option?.text || '';
     });
 
     const { lock: lockScroll, unlock: unlockScroll } = useScrollLock();
 
-    const toggle = () => {
+    const openedViaKeyboard = ref(false);
+    // ponytail: side-based origin (flip-aware); exact trigger point needs middlewareData, overkill here
+    const originClass = computed(() =>
+      String(placement.value || '').startsWith('top')
+        ? 'origin-bottom-left'
+        : 'origin-top-left',
+    );
+
+    const toggle = (instant = false) => {
+      openedViaKeyboard.value = instant;
       if (!isOpen.value) {
         lockScroll();
       } else {
@@ -239,7 +305,7 @@ export default {
           optionRefs.value = [];
 
           const currentIndex = filteredOptions.value.findIndex(
-            (opt) => opt.value === String(props.modelValue)
+            (opt) => opt.value === String(props.modelValue),
           );
           focusedIndex.value = Math.max(0, currentIndex);
 
@@ -294,7 +360,7 @@ export default {
       if (!isOpen.value) {
         if (['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(e.key)) {
           e.preventDefault();
-          toggle();
+          toggle(true);
         }
         return;
       }
@@ -375,6 +441,18 @@ export default {
       }
     });
 
+    const radiusClass = computed(() => {
+      const map = {
+        sm: 'rounded-sm',
+        md: 'rounded-md',
+        lg: 'rounded-lg',
+        xl: 'rounded-xl',
+        '2xl': 'rounded-2xl',
+        full: 'rounded-full',
+      };
+      return map[props.radius] || 'rounded-xl';
+    });
+
     return {
       selectId,
       selectButton,
@@ -386,6 +464,9 @@ export default {
       selectedText,
       filteredOptions,
       optionRefs,
+      floatingStyles,
+      originClass,
+      openedViaKeyboard,
       translations,
       setOptionRef,
       toggle,
@@ -393,6 +474,7 @@ export default {
       onKeydown,
       onSearchKeydown,
       handleBlur,
+      radiusClass,
     };
   },
 };
@@ -408,7 +490,6 @@ export default {
   @apply bg-neutral-100 dark:bg-neutral-700;
 }
 
-/* Ensure dropdown is above other elements */
 .ui-select .z-50 {
   z-index: 50;
 }

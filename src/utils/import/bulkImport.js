@@ -1,16 +1,16 @@
 import { v4 as uuidv4 } from 'uuid';
 import { path } from '@/lib/tauri-bridge';
-import { ensureDir, readDir, readFile, writeFile } from '@/lib/native/fs';
+import { ensureDir, readDir, readFile, readFileBinaryBytes, writeFile } from '@/lib/native/fs';
 import { onImportComplete, onImportProgress } from '@/lib/native/imports';
 import { useNoteStore } from '@/store/note';
 import { useFolderStore } from '@/store/folder';
-import { base64ToUint8Array } from '@/utils/helpers/index.js';
 import { convertMarkdownToTiptap } from '@/utils/markdown';
 import {
   createMediaFallbackNode,
   sanitizeImageSource,
   sanitizeImportedHtml,
 } from '@/utils/note/contentSecurity.js';
+import { ensureKeyReadyForWrite } from '@/utils/crypto/encryption.js';
 import {
   stripExtension,
   stripNotionId,
@@ -23,6 +23,7 @@ import {
   copyDirectoryContents,
   prepareMarkdownStaging,
   addImportedNote,
+  flushImportedNotes,
   importMarkdownFile,
   parseDateValue,
   mergeLabels,
@@ -35,9 +36,38 @@ import {
   resolveRelativeFileValue,
 } from './helpers';
 
-// ─── HTML to Tiptap conversion ───────────────────────────────────────────────
 
-async function convertHtmlNodeToTiptap(node, noteId, resources = []) {
+/** Group inline nodes into paragraphs so block parents never hold bare text (invalid ProseMirror, renders blank). */
+function wrapInlineContent(nodes, sourceNode) {
+  const blocks = [];
+  let run = [];
+  const flush = () => {
+    if (run.length > 0) {
+      blocks.push({ type: 'paragraph', content: run });
+      run = [];
+    }
+  };
+  for (const child of nodes || []) {
+    if (child && (child.type === 'text' || child.type === 'hardBreak')) {
+      run.push(child);
+    } else {
+      flush();
+      if (child) blocks.push(child);
+    }
+  }
+  flush();
+  if (blocks.length === 0) {
+    const text = sourceNode ? extractTextContent(sourceNode) : '';
+    blocks.push(
+      text
+        ? { type: 'paragraph', content: [{ type: 'text', text }] }
+        : { type: 'paragraph' }
+    );
+  }
+  return blocks;
+}
+
+function convertHtmlNodeToTiptap(node, noteId, resources = []) {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent || '';
     if (!text.trim()) return null;
@@ -50,16 +80,14 @@ async function convertHtmlNodeToTiptap(node, noteId, resources = []) {
 
   const tagName = node.tagName.toUpperCase();
   let content = flattenNodes(
-    (
-      await Promise.all(
-        Array.from(node.childNodes || []).map((child) =>
-          convertHtmlNodeToTiptap(child, noteId, resources)
-        )
-      )
-    ).filter(Boolean)
+    Array.from(node.childNodes || [])
+      .map((child) => convertHtmlNodeToTiptap(child, noteId, resources))
+      .filter(Boolean)
   );
 
   switch (tagName) {
+    case 'DIV':
+      return wrapInlineContent(content, node);
     case 'P':
       return { type: 'paragraph', content };
     case 'H1':
@@ -89,20 +117,9 @@ async function convertHtmlNodeToTiptap(node, noteId, resources = []) {
         ),
       };
     case 'LI':
-      return {
-        type: 'listItem',
-        content:
-          content.length > 0
-            ? content
-            : [
-                {
-                  type: 'paragraph',
-                  content: [{ type: 'text', text: extractTextContent(node) }],
-                },
-              ],
-      };
+      return { type: 'listItem', content: wrapInlineContent(content, node) };
     case 'BLOCKQUOTE':
-      return { type: 'blockquote', content };
+      return { type: 'blockquote', content: wrapInlineContent(content, node) };
     case 'PRE': {
       const codeElement = node.querySelector('code');
       const codeText = codeElement?.textContent || node.textContent || '';
@@ -215,12 +232,19 @@ async function convertHtmlNodeToTiptap(node, noteId, resources = []) {
   }
 }
 
-// ─── Native Rust import ──────────────────────────────────────────────────────
 
-async function processRustImportNote(note, state) {
+async function processWithConcurrency(items, fn, concurrency = 4) {
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    await Promise.all(batch.map(fn));
+    if (typeof yieldToUi === 'function') await yieldToUi();
+  }
+}
+
+
+async function processRustImportNote(note, state, appDirectory) {
   const noteStore = useNoteStore();
   const folderStore = useFolderStore();
-  const appDirectory = await ensureAppDirectory();
   const id = uuidv4();
   let folderId = null;
 
@@ -238,33 +262,30 @@ async function processRustImportNote(note, state) {
     }
   }
 
-  const noteAssetDir = path.join(appDirectory, 'notes-assets', id);
+  const noteAssetDir = path.join(appDirectory, 'assets', id);
   await ensureDir(noteAssetDir);
 
-  const fileAssetDir = path.join(appDirectory, 'file-assets', id);
-  await ensureDir(fileAssetDir);
+  await ensureKeyReadyForWrite();
 
-  for (const resource of note.resources || []) {
-    try {
-      const data = base64ToUint8Array(resource.data || '');
-      await writeFile(
-        path.join(noteAssetDir, resource.filename || resource.hash),
-        data
-      );
-      await writeFile(
-        path.join(fileAssetDir, resource.filename || resource.hash),
-        data
-      );
-    } catch (error) {
-      console.warn('Resource write failed:', error);
-    }
-  }
+  const resourcePromises = (note.resources || []).map((resource) => {
+    const dest = path.join(noteAssetDir, resource.filename || resource.hash);
+    return readFileBinaryBytes(resource.path)
+      .then((data) => writeFile(dest, data))
+      .catch((error) => {
+        console.warn('Resource write failed:', error);
+        state.errors.push({
+          title: note.title || 'Untitled',
+          reason: `Asset ${resource.filename || resource.hash} could not be saved: ${error?.message || String(error)}`,
+        });
+      });
+  });
+  await Promise.all(resourcePromises);
 
   const content = await htmlToTiptap(note.content || '', id, appDirectory, {
     resources: note.resources || [],
   });
 
-  await addImportedNote(noteStore, {
+  addImportedNote(noteStore, {
     id,
     title: note.title || 'Untitled',
     content,
@@ -284,67 +305,75 @@ export function startRustImport(source, onProgress) {
       folderIds: new Set(),
       errors: [],
     };
-    let completionErrors = [];
-    let processing = Promise.resolve();
+    const pendingNotes = [];
 
     (async () => {
-    const unlistenProgress = await onImportProgress(async (_, payload) => {
-      if (payload.source !== source) return;
+      const appDirectory = await ensureAppDirectory();
 
-      if (typeof onProgress === 'function') {
-        onProgress({
-          done: payload.done,
-          total: payload.total,
-          current: payload.current,
-        });
-      }
+      const unlistenProgress = await onImportProgress(async (_, payload) => {
+        if (payload.source !== source) return;
 
-      if (payload.note) {
-        processing = processing.then(async () => {
-          try {
-            await processRustImportNote(payload.note, state);
-          } catch (error) {
-            state.errors.push({
-              title: payload.note.title || 'Untitled',
-              reason: error?.message || String(error),
-            });
-          }
-        });
-      }
-    });
+        if (typeof onProgress === 'function') {
+          onProgress({
+            done: payload.done,
+            total: payload.total,
+            current: payload.current,
+          });
+        }
 
-    const unlistenComplete = await onImportComplete(async (_, payload) => {
-      if (payload.source !== source) return;
-
-      completionErrors = [...(payload.errors || [])];
-      unlistenProgress();
-      unlistenComplete();
-      await processing;
-
-      resolve({
-        imported: state.imported,
-        folders: state.folderIds.size,
-        errors: [...completionErrors, ...state.errors],
+        if (payload.note) {
+          pendingNotes.push(payload.note);
+        }
       });
-    });
+
+      const unlistenComplete = await onImportComplete(async (_, payload) => {
+        if (payload.source !== source) return;
+
+        unlistenProgress();
+        unlistenComplete();
+
+        await processWithConcurrency(
+          pendingNotes,
+          async (note) => {
+            try {
+              await processRustImportNote(note, state, appDirectory);
+            } catch (error) {
+              state.errors.push({
+                title: note.title || 'Untitled',
+                reason: error?.message || String(error),
+              });
+            }
+          },
+          4
+        );
+
+        await flushImportedNotes();
+
+        resolve({
+          imported: state.imported,
+          folders: state.folderIds.size,
+          errors: [...(payload.errors || []), ...state.errors],
+        });
+      });
     })();
   });
 }
 
-export async function htmlToTiptap(html, noteId, _appDirectory, options = {}) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(
-    sanitizeImportedHtml(html, { allowRelative: true }),
-    'text/html'
-  );
+export function htmlToTiptap(html, noteId, _appDirectory, options = {}) {
+  const resources = options.resources || [];
+  const resourceMap =
+    resources.length > 0
+      ? new Map(resources.map((r) => [r.hash, r]))
+      : resources;
+
+  const doc =
+    html instanceof Document
+      ? html
+      : sanitizeImportedHtml(html, { allowRelative: true });
   const content = flattenNodes(
-    (
-      await Promise.all(
-        Array.from(doc.body.childNodes || []).map((node) =>
-          convertHtmlNodeToTiptap(node, noteId, options.resources || [])
-        )
-      )
-    ).filter(Boolean)
+    Array.from(doc.body.childNodes || [])
+      .map((node) => convertHtmlNodeToTiptap(node, noteId, resourceMap))
+      .filter(Boolean)
   );
 
   return {
@@ -353,7 +382,6 @@ export async function htmlToTiptap(html, noteId, _appDirectory, options = {}) {
   };
 }
 
-// ─── Bulk platform importers ─────────────────────────────────────────────────
 
 export async function importObsidian(
   vaultPath,
@@ -375,7 +403,7 @@ export async function importObsidian(
   for (const filePath of files) {
     try {
       const markdown = await readFile(filePath);
-      const { meta } = parseFrontmatter(markdown);
+      const { meta, body } = parseFrontmatter(markdown);
       const fallbackTitle = stripExtension(path.basename(filePath));
       const title = meta.title || fallbackTitle || 'Untitled';
       const assetDir = path.join(path.dirname(filePath), title);
@@ -391,6 +419,8 @@ export async function importObsidian(
         onProgress,
         done: done + 1,
         total: files.length,
+        rawMarkdown: markdown,
+        parsedMeta: { meta, body },
       });
       imported += 1;
     } catch (error) {
@@ -410,6 +440,7 @@ export async function importObsidian(
     }
   }
 
+  await flushImportedNotes();
   return { imported, folders: createdFolderIds.size, errors };
 }
 
@@ -470,12 +501,12 @@ export async function importNotion(
         if (await pathExists(assetDir)) {
           await copyDirectoryContents(
             assetDir,
-            path.join(resolvedAppDirectory, 'notes-assets', id)
+            path.join(resolvedAppDirectory, 'assets', id)
           );
         }
 
         const content = await htmlToTiptap(html, id, resolvedAppDirectory);
-        await addImportedNote(noteStore, {
+        addImportedNote(noteStore, {
           id,
           title,
           content,
@@ -496,6 +527,7 @@ export async function importNotion(
     }
   }
 
+  await flushImportedNotes();
   return { imported, folders: createdFolderIds.size, errors };
 }
 
@@ -530,14 +562,7 @@ export async function importBear(
         : exportPath;
       const { content } = await convertMarkdownToTiptap(body, id, stagingRoot);
 
-      if (await pathExists(assetDir)) {
-        await copyDirectoryContents(
-          assetDir,
-          path.join(resolvedAppDirectory, 'notes-assets', id)
-        );
-      }
-
-      await addImportedNote(noteStore, {
+      addImportedNote(noteStore, {
         id,
         title,
         content,
@@ -563,6 +588,7 @@ export async function importBear(
     }
   }
 
+  await flushImportedNotes();
   return { imported, folders: 0, errors };
 }
 
@@ -586,7 +612,7 @@ export async function importSimplenote(jsonPath, noteStore, onProgress) {
         path.dirname(jsonPath)
       );
 
-      await addImportedNote(noteStore, {
+      addImportedNote(noteStore, {
         id,
         title: titleLine.trim() || 'Untitled',
         content,
@@ -616,6 +642,7 @@ export async function importSimplenote(jsonPath, noteStore, onProgress) {
     }
   }
 
+  await flushImportedNotes();
   return { imported, folders: 0, errors };
 }
 
@@ -664,5 +691,6 @@ export async function importGenericMarkdown(
     }
   }
 
+  await flushImportedNotes();
   return { imported, folders: createdFolderIds.size, errors };
 }

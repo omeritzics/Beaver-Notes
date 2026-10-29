@@ -6,6 +6,11 @@ import StarterKit from '@tiptap/starter-kit';
 import { Highlight } from './exts/highlight';
 import Typography from '@tiptap/extension-typography';
 import Link from '@tiptap/extension-link';
+import { registerCustomProtocol } from 'linkifyjs';
+
+['http', 'https', 'mailto', 'note'].forEach((scheme) =>
+  registerCustomProtocol(scheme)
+);
 import Code from '@tiptap/extension-code';
 import markdownEngine from './exts/markdown-engine';
 import { Paste } from './exts/markdown-engine/paste';
@@ -13,6 +18,7 @@ import Placeholder from '@tiptap/extension-placeholder';
 import TaskList from '@tiptap/extension-task-list';
 import TaskItem from '@tiptap/extension-task-item';
 import LabelSuggestion from './exts/label-suggestion';
+import UserMention from './exts/user-mention';
 import MathInline from './exts/math-inline';
 import MathBlock from './exts/math-block';
 import MermaidBlock from './exts/mermaid-block';
@@ -27,6 +33,7 @@ import Text from '@tiptap/extension-text';
 import CollapseHeading from './exts/collapse-heading';
 import SearchAndReplace from '@sereneinserenade/tiptap-search-and-replace';
 import Dropcursor from '@tiptap/extension-dropcursor';
+import { CharacterCount } from '@tiptap/extensions';
 import {
   blueCallout,
   yellowCallout,
@@ -54,17 +61,18 @@ import FontSize from 'tiptap-extension-font-size';
 import TextAlign from '@tiptap/extension-text-align';
 import Paper from './exts/paper-block';
 import { dropFile } from './exts/drop-file';
-import { getTranslations } from '@/utils/getTranslations';
-import { getSettingSync } from '@/composable/settings';
+import { getTranslations } from '@/utils/i18n/getTranslations';
+import { getSettingSync } from '@/lib/settings';
 const translations = getTranslations();
 
-const directionPreference = getSettingSync('directionPreference');
-
-const defaultDirection = directionPreference === 'rtl' ? 'rtl' : 'ltr';
+function getDefaultDirection() {
+  return getSettingSync('directionPreference') === 'rtl' ? 'rtl' : 'ltr';
+}
 
 function createBaseExtensions({ yjs = false } = {}) {
   return [
     LabelSuggestion,
+    UserMention,
     StarterKit.configure({
       heading: false,
       text: false,
@@ -72,11 +80,8 @@ function createBaseExtensions({ yjs = false } = {}) {
       code: false,
       link: false,
       document: false,
-      paste: false,
       dropcursor: false,
-      // Collaboration extension adds yUndoPlugin — skip built-in history to
-      // avoid the "not compatible with undo-redo" console warning.
-      history: !yjs,
+      undoRedo: !yjs,
     }),
     Paste,
     Document.extend({
@@ -138,12 +143,14 @@ function createBaseExtensions({ yjs = false } = {}) {
     }),
     Superscript,
     TextDirection.configure({
-      defaultDirection: defaultDirection,
+      types: ['heading', 'paragraph', 'blockquote', 'listItem', 'codeBlock'],
+      defaultDirection: getDefaultDirection(),
     }),
     Image,
     Audio,
     SearchAndReplace.configure(),
     TextStyle,
+    CharacterCount,
     TextAlign.configure({
       types: ['heading', 'paragraph'],
     }),
@@ -155,6 +162,8 @@ function createBaseExtensions({ yjs = false } = {}) {
     Code.configure({ HTMLAttributes: { class: 'inline-code' } }),
     Link.extend({
       inclusive: false,
+      onCreate() {},
+      onDestroy() {},
       addKeyboardShortcuts() {
         return {
           'Mod-k': () =>
@@ -178,25 +187,12 @@ const yjsExtensions = createBaseExtensions({ yjs: true });
 
 export { extensions, yjsExtensions, createBaseExtensions, CollapseHeading, heading, dropFile, Commands };
 
-let _prewarmed = false;
-export function prewarmEditor() {
-  if (_prewarmed || typeof document === 'undefined') return;
-  _prewarmed = true;
-  const host = document.createElement('div');
-  host.style.cssText = 'position:fixed;left:-9999px;top:-9999px;visibility:hidden';
-  document.body.appendChild(host);
-  try {
-    const e = new Editor({ extensions: yjsExtensions, content: '' });
-    e.destroy();
-  } catch {
-    //non-critical
-  }
-  host.remove();
-}
-
 export default function ({ extensions: optsExts, ...opts }) {
   const instance = new Editor({
     ...opts,
+    // The app ships its own Paste + TextDirection; drop tiptap's core
+    // duplicates (they'd otherwise collide by name).
+    enableCoreExtensions: { paste: false, textDirection: false },
     extensions: [...extensions, ...(optsExts || [])],
   });
 

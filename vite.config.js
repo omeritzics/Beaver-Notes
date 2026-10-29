@@ -30,31 +30,34 @@ export default defineConfig({
       },
     },
   },
+  esbuild: {
+    pure: ['console.log', 'console.debug', 'console.info'],
+    drop: ['debugger'],
+  },
   build: {
     sourcemap: false,
-    minify: 'terser',
     target: ['es2021', 'chrome100', 'safari13'],
     outDir: 'dist',
     chunkSizeWarningLimit: 1600,
     assetsDir: '.',
-    terserOptions: {
-      ecma: 2020,
-      compress: {
-        passes: 1,
-        pure_funcs: ['console.log', 'console.debug', 'console.info'],
-        drop_debugger: true,
-        pure_getters: true,
-        module: true,
-      },
-      format: { comments: false },
-      safari10: false,
-    },
     rollupOptions: {
       output: {
-        manualChunks: {
-          editor: ['@tiptap/core', 'prosemirror-model', 'prosemirror-view'],
-          mermaid: ['mermaid'],
-          katex: ['katex'],
+        // Object form was removed in Vite 8 (Rolldown requires a function)
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+          if (/[\\/]node_modules[\\/](vue|vue-router|pinia)[\\/]/.test(id))
+            return 'vue';
+          if (/[\\/]node_modules[\\/](yjs|y-prosemirror|lib0)[\\/]/.test(id))
+            return 'yjs';
+          if (
+            /[\\/]node_modules[\\/](@tiptap[\\/]core|prosemirror-model|prosemirror-view)[\\/]/.test(
+              id,
+            )
+          )
+            return 'editor';
+          if (/[\\/]node_modules[\\/]beautiful-mermaid[\\/]/.test(id))
+            return 'beautiful-mermaid';
+          if (/[\\/]node_modules[\\/]katex[\\/]/.test(id)) return 'katex';
         },
       },
     },

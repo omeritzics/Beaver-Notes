@@ -8,6 +8,7 @@ use tauri_plugin_dialog::{DialogExt, FilePath, MessageDialogButtons, MessageDial
 use crate::shared::*;
 
 #[tauri::command]
+#[specta::specta]
 pub(crate) async fn dialog_open(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -80,6 +81,7 @@ pub(crate) async fn dialog_open(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub(crate) async fn dialog_message(
     app: AppHandle,
     props: MessageDialogOptions,
@@ -110,6 +112,7 @@ pub(crate) async fn dialog_message(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub(crate) async fn dialog_save(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -164,27 +167,33 @@ pub(crate) async fn dialog_save(
 
     Ok(SaveDialogResult {
         canceled: file_path.is_none(),
-        file_path: file_path.and_then(|fp: FilePath| match fp {
-            FilePath::Path(p) => Some(p.to_string_lossy().to_string()),
-            FilePath::Url(url) => Some(url.to_string()),
+        file_path: file_path.map(|fp: FilePath| match fp {
+            FilePath::Path(p) => p.to_string_lossy().to_string(),
+            FilePath::Url(url) => url.to_string(),
         }),
     })
 }
 
 #[tauri::command]
-pub(crate) fn get_system_fonts() -> Result<Vec<String>, AppError> {
-    #[cfg(target_os = "android")]
-    {
-        return Ok(Vec::new());
-    }
+#[specta::specta]
+pub(crate) async fn get_system_fonts() -> Result<Vec<String>, AppError> {
+    // Whole-system font scan (100ms+): keep off main thread.
+    tokio::task::spawn_blocking(|| {
+        #[cfg(target_os = "android")]
+        {
+            return Ok(Vec::new());
+        }
 
-    #[cfg(not(target_os = "android"))]
-    {
-        let fonts = SystemSource::new()
-            .all_families()
-            .map_err(to_error)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        Ok(fonts)
-    }
+        #[cfg(not(target_os = "android"))]
+        {
+            let fonts = SystemSource::new()
+                .all_families()
+                .map_err(to_error)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            Ok(fonts)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))?
 }

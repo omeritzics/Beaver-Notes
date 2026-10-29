@@ -1,3 +1,4 @@
+import java.io.FileInputStream
 import java.util.Properties
 
 plugins {
@@ -15,10 +16,10 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
-    namespace = "com.danielerolli.beaver_notes"
+    namespace = "com.beavernotes.beaver_notes"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.danielerolli.beaver_notes"
+        applicationId = "com.beavernotes.beaver_notes"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -26,11 +27,15 @@ android {
     }
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH") ?: return@create
-            storeFile = file(keystorePath)
-            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: return@create
-            keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: return@create
-            keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: return@create
+            val keystorePropertiesFile = rootProject.file("keystore.properties")
+            val keystoreProperties = Properties()
+            if (keystorePropertiesFile.exists()) {
+                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+            }
+            storeFile = file(keystoreProperties["storeFile"] as? String ?: return@create)
+            storePassword = keystoreProperties["storePassword"] as? String ?: return@create
+            keyAlias = keystoreProperties["keyAlias"] as? String ?: return@create
+            keyPassword = keystoreProperties["keyPassword"] as? String ?: return@create
         }
     }
 
@@ -73,6 +78,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

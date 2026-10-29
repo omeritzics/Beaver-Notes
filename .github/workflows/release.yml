@@ -2,9 +2,6 @@ name: Release
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -39,7 +36,7 @@ jobs:
         shell: bash
         run: |
           corepack enable
-          corepack prepare yarn@stable --activate
+          corepack prepare yarn@1.22.22 --activate
 
       # package.json is the source of truth for the release version.
       - name: Read version from package.json
@@ -105,15 +102,42 @@ jobs:
         run: |
           yarn lint
 
-      - name: Run unit tests
-        run: yarn test
-      - name: Run Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
-
-      - name: Validate IPC command map
+      - name: Run typecheck
         shell: bash
         run: |
-          yarn validate:commands
+          yarn typecheck
+
+      - name: Run unit tests
+        shell: bash
+        run: yarn test
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libfreetype-dev \
+            libfontconfig-dev \
+            patchelf \
+            xdg-utils \
+            gnupg
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: validate
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
       - name: Audit npm dependencies
         shell: bash
@@ -127,26 +151,42 @@ jobs:
 
       # Rust audit — catches RUSTSEC advisories
       - name: Install cargo-audit
-        shell: bash
-        run: |
-          if ! command -v cargo-audit &>/dev/null; then
-            cargo install cargo-audit
-          fi
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Audit Rust dependencies
         shell: bash
         run: |
           cd src-tauri && cargo audit
 
-      - name: Run Rust tests
-        shell: bash
-        run: |
-          cd src-tauri && cargo test
+  create-release:
+    name: Create draft release
+    if: ${{ needs.validate.outputs.version_match == 'true' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.id }}
+
+    steps:
+      - name: Create empty draft release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag_name }}
+          name: ${{ needs.validate.outputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 
   desktop:
     name: Build ${{ matrix.id }}
     if: ${{ needs.validate.outputs.version_match == 'true' }}
-    needs: validate
+    needs:
+      - validate
+      - create-release
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -175,26 +215,10 @@ jobs:
             tauri_target: 'aarch64-unknown-linux-gnu'
             asset_suffix: 'linux-arm64'
 
-          # Windows is build
-          - id: windows-x64
-            runner: windows-latest
-            rust_targets: 'x86_64-pc-windows-msvc'
-            tauri_target: 'x86_64-pc-windows-msvc'
-            bundle_args: '--bundles nsis'
-            asset_suffix: 'windows-x64'
-
-          # ARM64 Windows build
-          - id: windows-arm64
-            runner: windows-11-arm
-            rust_targets: 'aarch64-pc-windows-msvc'
-            tauri_target: 'aarch64-pc-windows-msvc'
-            bundle_args: '--bundles nsis'
-            asset_suffix: 'windows-arm64'
-
           # Android build (APK + AAB)
           - id: android
             runner: ubuntu-24.04
-            rust_targets: 'aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android'
+            rust_targets: 'aarch64-linux-android,x86_64-linux-android'
             asset_suffix: 'android'
 
           # iOS build
@@ -227,7 +251,7 @@ jobs:
         shell: bash
         run: |
           corepack enable
-          corepack prepare yarn@stable --activate
+          corepack prepare yarn@1.22.22 --activate
           yarn --version
 
       # Install the Rust targets needed for each matrix job
@@ -255,6 +279,9 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            libasound2-dev \
+            libfreetype-dev \
+            libfontconfig-dev \
             patchelf \
             xdg-utils \
             gnupg
@@ -266,7 +293,21 @@ jobs:
           yarn install --frozen-lockfile
 
       # macOS signing and notarization
-      - name: Build macOS bundles
+      - name: Diagnostic — check notarytool connectivity
+        if: ${{ matrix.id == 'macos-universal' }}
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "==> Checking notarytool history: $(date -u +%FT%TZ)"
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" 2>&1 | head -5 || echo "WARNING: notarytool check failed"
+
+      - name: Build macOS bundles (signed + notarized)
         if: ${{ matrix.id == 'macos-universal' }}
         shell: bash
         env:
@@ -276,48 +317,28 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          echo "==> Build start: $(date -u +%FT%TZ)"
           yarn tauri build \
             --target "${{ matrix.tauri_target }}" \
             ${{ matrix.bundle_args }} \
             --ci
+          echo "==> Build end: $(date -u +%FT%TZ)"
 
-      # Linux binary build (no AppImage/deb/rpm bundles)
+      # Linux build (binary only for Flatpak)
       - name: Build Linux binary
         if: ${{ startsWith(matrix.id, 'linux-') }}
         shell: bash
         env:
           CI: 'true'
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           yarn tauri build \
             --target "${{ matrix.tauri_target }}" \
-            --ci
-
-      # Install OSSign for Windows code signing
-      - name: Install OSSign
-        if: ${{ startsWith(matrix.id, 'windows-') }}
-        uses: ossign/ossign@main
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          installOnly: true
-
-      - name: Build Windows bundles
-        if: ${{ startsWith(matrix.id, 'windows-') }}
-        shell: bash
-        env:
-          CI: 'true'
-          OSSIGN_CONFIG_BASE64: ${{ secrets.OSSIGN_CONFIG_BASE64 }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          yarn tauri build \
-            --target "${{ matrix.tauri_target }}" \
-            ${{ matrix.bundle_args }} \
+            --no-bundle \
             --ci
 
       # macOS release assets: DMG plus updater files
@@ -335,10 +356,13 @@ jobs:
             \( -name "*.dmg" -o -name "*.app.tar.gz" -o -name "*.sig" -o -name "latest.json" \) \
             -exec cp {} "$OUT"/ \;
 
-      # Linux release assets: portable tarball and updater artifacts
+      # Linux release assets: binary tarball + AppImage + updater signature
       - name: Stage Linux assets
         if: ${{ startsWith(matrix.id, 'linux-') }}
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -347,17 +371,66 @@ jobs:
           OUT="release-assets"
           BIN_NAME="beaver-notes"
           BIN_PATH="src-tauri/target/${TARGET}/release/${BIN_NAME}"
-          TAR_NAME="Beaver Notes-${VERSION}-${{ matrix.asset_suffix }}.tar.gz"
+          
+          # Determine architecture
+          if [[ "$TARGET" == *"x86_64"* ]]; then
+            ARCH="x86_64"
+          elif [[ "$TARGET" == *"aarch64"* ]]; then
+            ARCH="aarch64"
+          else
+            echo "::error::Unsupported architecture in target: $TARGET"
+            exit 1
+          fi
+          
+          TAR_NAME="Beaver-Notes-${VERSION}-${ARCH}.tar.gz"
+          APPIMAGE_NAME="Beaver-Notes-${VERSION}-${ARCH}.AppImage"
 
           mkdir -p "$OUT"
 
-          cp "src-tauri/target/${TARGET}/release/bundle/latest.json" "$OUT/" 2>/dev/null || true
+          # Create FHS tarball
+          mkdir -p "portable-root/bin"
+          mkdir -p "portable-root/lib/beaver-notes"
+          mkdir -p "portable-root/share/applications"
+          mkdir -p "portable-root/share/icons/hicolor/1024x1024/apps"
+          mkdir -p "portable-root/share/metainfo"
 
-          find "src-tauri/target/${TARGET}/release/bundle" -type f -name "*.sig" -exec cp {} "$OUT"/ \; 2>/dev/null || true
+          cp "$BIN_PATH" "portable-root/lib/beaver-notes/"
+          cp -r src-tauri/target/${TARGET}/release/bundle/appimage/resources/* "portable-root/lib/beaver-notes/" 2>/dev/null || true
+          cp buildResources/icon.png "portable-root/share/icons/hicolor/1024x1024/apps/beaver-notes.png"
+          cp flatpak/com.beavernotes.beavernotes.metainfo.xml "portable-root/share/metainfo/"
 
-          mkdir -p portable-root
-          cp "$BIN_PATH" portable-root/
+          # Create wrapper script
+          cat > "portable-root/bin/beaver-notes" << 'WRAPPER'
+          #!/bin/bash
+          exec "$(dirname "$0")/../lib/beaver-notes/beaver-notes" "$@"
+          WRAPPER
+          chmod +x "portable-root/bin/beaver-notes"
+
+          # Create desktop file
+          cat > "portable-root/share/applications/beaver-notes.desktop" << 'DESKTOP'
+          [Desktop Entry]
+          Name=Beaver Notes
+          Comment=Open-source notes that live where you choose
+          Exec=beaver-notes %F
+          Icon=beaver-notes
+          Type=Application
+          Categories=Utility;TextEditor;Office;
+          MimeType=text/markdown;text/plain;
+          Terminal=false
+          StartupWMClass=beaver-notes
+          DESKTOP
+
           tar -czf "$OUT/$TAR_NAME" -C portable-root .
+
+          # Build AppImage
+          chmod +x ./scripts/build-appimage.sh
+          ./scripts/build-appimage.sh "$VERSION" "$ARCH"
+          mv "$APPIMAGE_NAME" "$OUT/"
+
+          # Sign the tarball for updater
+          yarn tauri signer sign \
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "$OUT/$TAR_NAME"
 
       # Android build
       - name: Install Java
@@ -371,63 +444,190 @@ jobs:
         if: ${{ matrix.id == 'android' }}
         uses: android-actions/setup-android@v3
 
+      - name: Regenerate Android project for CI
+        if: ${{ matrix.id == 'android' }}
+        shell: bash
+        run: |
+          rm -rf src-tauri/gen/android
+          yarn tauri android init
+          # tauri android init regenerates the manifest without the alternate
+          # icon activity-alias entries and a res/ without the custom icons —
+          # restore the committed versions so app icon switching works.
+          rm -rf src-tauri/gen/android/app/src/main/res
+          git checkout -- src-tauri/gen/android/app/src/main/res
+          rm -f src-tauri/gen/android/app/src/main/AndroidManifest.xml
+          git checkout -- src-tauri/gen/android/app/src/main/AndroidManifest.xml
+
+      - name: Patch Android signing into build.gradle.kts
+        if: ${{ matrix.id == 'android' }}
+        shell: bash
+        run: |
+          ./scripts/patch-android-signing.sh
+
       - name: Setup Android keystore
         if: ${{ matrix.id == 'android' }}
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
-            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/beaver-notes.jks"
-            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/beaver-notes.jks" >> "$GITHUB_ENV"
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is not set"
+            exit 1
           fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore.jks"
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/keystore.jks
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
 
       - name: Build Android app
         if: ${{ matrix.id == 'android' }}
         shell: bash
         env:
           CI: 'true'
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: |
-          cargo tauri android build --apk --aab
+          yarn tauri android build --apk --aab
 
       # iOS build
+      - name: Regenerate iOS project
+        if: ${{ matrix.id == 'ios' }}
+        shell: bash
+        run: |
+          rm -rf src-tauri/gen/apple
+          yarn tauri ios init
+          # The Tauri template ships its own default icon set — restore the
+          # committed custom Assets.xcassets (app icons + alternates).
+          rm -rf src-tauri/gen/apple/Assets.xcassets
+          git checkout -- src-tauri/gen/apple/Assets.xcassets
+
+      - name: Fix iOS bundle version
+        if: ${{ matrix.id == 'ios' }}
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version.replace(/-.*$/, '')")"
+          sed -i '' "s/CFBundleShortVersionString: '.*'/CFBundleShortVersionString: '$VERSION'/" \
+            src-tauri/gen/apple/project.yml
+          sed -i '' "s/CFBundleVersion: '.*'/CFBundleVersion: '$VERSION'/" \
+            src-tauri/gen/apple/project.yml
+
+      - name: Set iOS development team
+        if: ${{ matrix.id == 'ios' }}
+        run: |
+          sed -i '' 's/DEVELOPMENT_TEAM: .*$/DEVELOPMENT_TEAM: F8U6VTU2DJ/' \
+            src-tauri/gen/apple/project.yml
+
+      - name: Configure iOS distribution signing
+        if: ${{ matrix.id == 'ios' }}
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          path = 'src-tauri/gen/apple/project.yml'
+          s = open(path).read()
+          if 'CODE_SIGN_IDENTITY' not in s:
+              s = re.sub(
+                  r'(?m)^(\s+)dependencies:\n',
+                  '      configs:\n        release:\n          CODE_SIGN_IDENTITY: iPhone Distribution\n'
+                  + '\\1dependencies:\n',
+                  s,
+                  count=1,
+              )
+          if 'ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES' not in s:
+              s = s.replace(
+                  'DEVELOPMENT_TEAM: F8U6VTU2DJ',
+                  'DEVELOPMENT_TEAM: F8U6VTU2DJ\n'
+                  + '        ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES: \'"AppIcon 1" "AppIcon 2" "AppIcon 3" "AppIcon 4" "AppIcon 5" "AppIcon 6" "AppIcon 7" "AppIcon 8"\'',
+              )
+          open(path, 'w').write(s)
+
+          # tauri ios build never re-runs XcodeGen, so project.yml edits above do
+          # not reach the .xcodeproj — patch the generated pbxproj directly so
+          # actool compiles the alternate app icons.
+          pbx_path = 'src-tauri/gen/apple/beaver-notes.xcodeproj/project.pbxproj'
+          pbx = open(pbx_path).read()
+          if 'ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES' not in pbx:
+              alt = (
+                  'ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = '
+                  + '"\\"AppIcon 1\\" \\"AppIcon 2\\" \\"AppIcon 3\\" \\"AppIcon 4\\" \\"AppIcon 5\\" \\"AppIcon 6\\" \\"AppIcon 7\\" \\"AppIcon 8\\"";\n'
+                  + '\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;'
+              )
+              pbx = re.sub(
+                  r'(?m)(\n\t\t\t\tINFOPLIST_FILE = "[^"]+";)',
+                  lambda m: m.group(1) + '\n\t\t\t\t' + alt,
+                  pbx,
+              )
+              open(pbx_path, 'w').write(pbx)
+          PYEOF
+
+      - name: Write Apple API key
+        if: ${{ matrix.id == 'ios' }}
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/app-store-connect-api-key"
+          echo "$API_KEY" > "$RUNNER_TEMP/app-store-connect-api-key/AuthKey_${API_KEY_ID}.p8"
+
+      - name: Import iOS signing certificate
+        if: ${{ matrix.id == 'ios' }}
+        shell: bash
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+
+          # Decode certificate
+          echo "$IOS_CERTIFICATE_BASE64" | base64 -d > "$CERTIFICATE_PATH"
+
+          # Create and configure temporary keychain (no auto-lock timeout)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          security import "$CERTIFICATE_PATH" \
+            -P "$IOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Set keychain search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          # Allow codesign to access keychain without prompt
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
       - name: Build iOS app
         if: ${{ matrix.id == 'ios' }}
         shell: bash
         env:
           CI: 'true'
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_PASSWORD }}
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ format('{0}/app-store-connect-api-key/AuthKey_{1}.p8', runner.temp, secrets.APPLE_API_KEY_ID) }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_CERTIFICATE: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_IOS_SIGNING_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.APPLE_IOS_DISTRIBUTION_PROVISIONING_PROFILE }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          cargo tauri ios build
-
-      # Windows release assets: installer artifacts plus a portable zip
-      - name: Stage Windows assets
-        if: ${{ startsWith(matrix.id, 'windows-') }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $Version = "${{ needs.validate.outputs.version }}"
-          $Target = "${{ matrix.tauri_target }}"
-          $OutDir = "release-assets"
-          New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-
-          Get-ChildItem "src-tauri/target/$Target/release/bundle" -Recurse -File |
-            Where-Object { $_.Extension -in ".exe", ".msi", ".sig", ".json", ".zip" } |
-            ForEach-Object { Copy-Item $_.FullName -Destination $OutDir -Force }
-
-          $Binary = "src-tauri/target/$Target/release/beaver-notes.exe"
-          $PortableName = "Beaver Notes-$Version-portable-${{ matrix.asset_suffix }}.zip"
-          Compress-Archive -Path $Binary -DestinationPath (Join-Path $OutDir $PortableName) -Force
+          yarn tauri ios build --export-method app-store-connect
 
       # Android release assets: APK and AAB
       - name: Stage Android assets
@@ -444,87 +644,85 @@ jobs:
             -exec cp {} "$OUT"/ \;
 
       # iOS release assets
-      - name: Stage iOS assets
+      - name: Find iOS IPA
         if: ${{ matrix.id == 'ios' }}
+        id: find-ipa
         shell: bash
         run: |
-          set -euo pipefail
+          IPA=$(find src-tauri/gen/apple/build -name "*.ipa" -type f | head -1)
+          if [ -n "$IPA" ]; then
+            echo "ipa-path=$IPA" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No .ipa file found"
+          fi
 
-          OUT="release-assets"
-          mkdir -p "$OUT"
+      - name: Stage iOS assets
+        if: ${{ matrix.id == 'ios' && steps.find-ipa.outputs.ipa-path != '' }}
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "${{ steps.find-ipa.outputs.ipa-path }}" release-assets/
 
-          cp -R "src-tauri/gen/apple/build/beaver-notes_iOS.ipa" "$OUT/" 2>/dev/null || true
-
-      # --- Store submission (uncomment when ready) ---
-
-      # Upload Android AAB to Google Play Console
-      # Requires: PLAY_SERVICE_ACCOUNT_JSON secret (Google Play service account key)
-      #
-      # - name: Upload to Google Play
-      #   if: ${{ matrix.id == 'android' }}
-      #   uses: r0adkll/upload-google-play@v1
-      #   with:
-      #     serviceAccountJson: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
-      #     packageName: com.danielerolli.beaver_notes
-      #     releaseFiles: src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
-      #     track: production
-      #     status: completed
-
-      # Upload iOS IPA to App Store Connect via Transporter
-      # Requires: APPLE_ID + APPLE_ID_PASSWORD (app-specific password) secrets
-      #
-      # - name: Upload to App Store Connect
-      #   if: ${{ matrix.id == 'ios' }}
-      #   shell: bash
-      #   env:
-      #     APPLE_ID: ${{ secrets.APPLE_ID }}
-      #     APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-      #   run: |
-      #     xcrun transporter --upload \
-      #       -f "src-tauri/gen/apple/build/beaver-notes_iOS.ipa" \
-      #       -u "$APPLE_ID" \
-      #       -p "$APPLE_ID_PASSWORD"
-
-      # Ship each platform's files to the publish job
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      # Upload iOS IPA to TestFlight via App Store Connect API
+      - name: Upload to TestFlight
+        if: ${{ matrix.id == 'ios' && steps.find-ipa.outputs.ipa-path != '' }}
+        uses: apple-actions/upload-testflight-build@v4
         with:
-          name: ${{ matrix.id }}
-          path: release-assets/*
-          if-no-files-found: error
+          app-path: ${{ steps.find-ipa.outputs.ipa-path }}
+          issuer-id: ${{ secrets.APPLE_API_ISSUER }}
+          api-key-id: ${{ secrets.APPLE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPLE_API_KEY }}
+          wait-for-processing: false
 
-  publish:
-    name: Publish draft release
+      - name: Upload to release
+        if: ${{ hashFiles('release-assets/*') != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.validate.outputs.tag_name }}" release-assets/* --clobber
+
+  windows:
+    name: Build Windows (via OSSign)
     if: ${{ needs.validate.outputs.version_match == 'true' }}
     needs:
       - validate
-      - desktop
+      - create-release
     runs-on: ubuntu-latest
 
     steps:
-      # Gather all artifacts from every build job
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - name: Dispatch Windows signing
+        uses: ossign/actions/workflow/dispatch@main
+        id: dispatch
         with:
-          path: dist-artifacts
-          merge-multiple: true
+          username: beaver-notes
+          token: ${{ secrets.SIGNING_TOKEN }}
 
-      # Helpful when checking exactly what made it into the draft release
-      - name: Inspect downloaded artifacts
+      - name: Parse signed artifacts
+        shell: bash
+        run: |
+          printf "%s" "${{ steps.dispatch.outputs.signed_artifacts }}" > artifacts.json
+          echo "parsed=$(cat artifacts.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download signed artifacts
+        shell: bash
+        run: |
+          mkdir -p signed
+          for url in $(jq -r '.[].browser_download_url' artifacts.json); do
+            echo "Downloading $url"
+            curl -L -o "signed/$(basename "$url")" "$url"
+          done
+
+      - name: Stage Windows assets
         shell: bash
         run: |
           set -euo pipefail
-          ls -R dist-artifacts
+          rm -rf release-assets
+          mv signed release-assets
 
-      # Create or update the GitHub draft release with everything attached
-      - name: Create or update draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag_name }}
-          name: Beaver Notes ${{ needs.validate.outputs.version }}
-          draft: true
-          prerelease: false
-          files: dist-artifacts/*
-          fail_on_unmatched_files: true
+      - name: Upload to release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.validate.outputs.tag_name }}" release-assets/* --clobber

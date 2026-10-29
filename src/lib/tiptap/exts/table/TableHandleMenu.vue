@@ -7,7 +7,7 @@
     <!-- Cell Color -->
     <div class="px-2 py-1.5">
       <div class="flex items-center justify-between mb-1">
-        <span class="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
+        <span class="text-xs font-semibold font-bold tracking-wider text-neutral-400 dark:text-neutral-500">
           {{ t?.editor?.table?.cellColor || 'Cell color' }}
         </span>
       </div>
@@ -27,7 +27,7 @@
 
     <!-- Text Alignment -->
     <div class="px-2 py-1.5">
-      <span class="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
+      <span class="text-xs font-semibold font-bold tracking-wider text-neutral-400 dark:text-neutral-500">
         {{ t?.editor?.table?.textAlign || 'Align' }}
       </span>
       <div class="flex gap-1 mt-1.5">
@@ -54,6 +54,17 @@
     >
       <v-remixicon name="riBrush2Fill" class="size-6 shrink-0 text-neutral-500 dark:text-neutral-400" />
       <span>{{ t?.editor?.table?.toggleHeader || 'Toggle header' }}</span>
+    </button>
+
+    <div class="border-t border-neutral-100 dark:border-neutral-800 mx-2" />
+
+    <!-- Merge / Split -->
+    <button
+      class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-sm transition-colors text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+      @click="mergeOrSplit"
+    >
+      <v-remixicon :name="mergeOrSplitIcon" class="size-6 shrink-0 text-neutral-500 dark:text-neutral-400" />
+      <span>{{ mergeOrSplitLabel }}</span>
     </button>
 
     <div class="border-t border-neutral-100 dark:border-neutral-800 mx-2" />
@@ -117,7 +128,7 @@
         class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-sm transition-colors text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
         @click="deleteRowColumn"
       >
-        <v-remixicon name="orientation === 'row' ? 'riDeleteRow' : 'riDeleteColumn'" class="size-6 shrink-0 text-red-400" />
+        <v-remixicon :name="orientation === 'row' ? 'riDeleteRow' : 'riDeleteColumn'" class="size-6 shrink-0 text-red-400" />
         <span>{{ orientation === 'row' ? (t?.menu?.deleteRow || 'Delete row') : (t?.menu?.deleteColumn || 'Delete column') }}</span>
       </button>
       <button
@@ -133,8 +144,8 @@
 
 <script>
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { getTranslations } from '@/utils/getTranslations';
-import { getTable, getRowCells, getColumnCells, selectLastCell, TABLE_COLOR_SWATCHES, TABLE_ALIGN_OPTIONS } from './tiptap-table-utils.js';
+import { getTranslations } from '@/utils/i18n/getTranslations';
+import { getTable, getRowCells, getColumnCells, selectLastCell, getIndexCoordinates, selectCellsByCoords, TABLE_COLOR_SWATCHES, TABLE_ALIGN_OPTIONS } from './tiptap-table-utils.js';
 import { moveTableRow, moveTableColumn } from '@tiptap/pm/tables';
 
 export default {
@@ -187,19 +198,77 @@ export default {
       { label: t?.editor?.table?.sortDesc || 'Sort descending', icon: 'riSortDesc', run: () => sort('desc') },
     ]);
 
+    const mergeOrSplitState = computed(() => {
+      if (!props.editor) return 'merge';
+      const isRow = props.orientation === 'row';
+      const idx = isRow ? props.state?.rowIndex : props.state?.colIndex;
+      const tp = props.state?.blockPos;
+      if (idx == null || tp == null) return 'merge';
+      const table = getTable(props.editor, tp);
+      if (!table) return 'merge';
+      const cells = isRow
+        ? getRowCells(props.editor, idx, tp).cells
+        : getColumnCells(props.editor, idx, tp).cells;
+      const merged = cells.find(
+        (c) => (c.node?.attrs.colspan ?? 1) > 1 || (c.node?.attrs.rowspan ?? 1) > 1
+      );
+      return merged ? 'split' : 'merge';
+    });
+
+    const mergeOrSplitIcon = computed(() => {
+      return mergeOrSplitState.value === 'split' ? 'riSplitCellsVertical' : 'riMergeCellsHorizontal';
+    });
+
+    const mergeOrSplitLabel = computed(() => {
+      return mergeOrSplitState.value === 'split'
+        ? (t?.menu?.splitCell || 'Split cell')
+        : (t?.menu?.mergeCells || 'Merge cells');
+    });
+
+    function mergeOrSplit() {
+      if (!props.editor) return;
+      props.editor.chain().focus().mergeOrSplit().run();
+      close();
+    }
+
+    function ensureSelection() {
+      const isRow = props.orientation === 'row';
+      const idx = isRow ? props.state?.rowIndex : props.state?.colIndex;
+      const tp = props.state?.blockPos;
+      if (idx == null || tp == null) return false;
+      const coords = getIndexCoordinates({ editor: props.editor, index: idx, orientation: isRow ? 'row' : 'column', tablePos: tp });
+      if (!coords?.length) return false;
+      selectCellsByCoords(props.editor, tp, coords, { mode: 'dispatch', dispatch: props.editor.view.dispatch.bind(props.editor.view) });
+      return true;
+    }
+
     function setBg(color) {
       if (!props.editor) return;
+      const isRow = props.orientation === 'row';
+      const idx = isRow ? props.state?.rowIndex : props.state?.colIndex;
+      const tp = props.state?.blockPos;
+      if (idx != null && tp != null) {
+        const cells = isRow ? getRowCells(props.editor, idx, tp).cells : getColumnCells(props.editor, idx, tp).cells;
+        if (cells.length) {
+          let tr = props.editor.state.tr;
+          cells.forEach((c) => { if (c.node) tr = tr.setNodeMarkup(c.pos, undefined, { ...c.node.attrs, background: color }); });
+          props.editor.view.dispatch(tr);
+          return;
+        }
+      }
       props.editor.chain().focus().setCellAttribute('background', color).run();
     }
 
     function setAlign(align) {
       currentAlign.value = align;
       if (!props.editor) return;
+      ensureSelection();
       props.editor.chain().focus().setTextAlign(align).run();
     }
 
     function add(side) {
       if (!props.editor) return;
+      ensureSelection();
       if (props.orientation === 'row') {
         props.editor.chain().focus()[side === 'above' ? 'addRowBefore' : 'addRowAfter']().run();
       } else {
@@ -339,7 +408,8 @@ export default {
       t, menuRef, isHeaderActive, currentAlign,
       colorSwatches, alignOptions,
       moveItems, addItems, sortItems,
-      add, deleteRowColumn, deleteTable, duplicate, move, sort, toggleHeader, close,
+      mergeOrSplitIcon, mergeOrSplitLabel,
+      add, deleteRowColumn, deleteTable, duplicate, move, sort, toggleHeader, mergeOrSplit, close,
       setBg, setAlign,
     };
   },

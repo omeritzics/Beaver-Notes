@@ -23,7 +23,7 @@ pub(crate) fn sync_external_temp_file(
     let raw = fs::read(temp_file)?;
     let existing = fs::read(original_path)?;
     let payload = if is_encrypted_asset_buffer(&existing) {
-        encrypt_asset(app, &state, original_path, &raw, false)?
+        encrypt_asset(app, &state, original_path, &raw)?
     } else {
         raw
     };
@@ -85,7 +85,7 @@ fn watch_external_temp_file(
 
             std::thread::sleep(std::time::Duration::from_millis(150));
             if let Err(error) = sync_external_temp_file(&app, &original_path, &temp_file) {
-                eprintln!(
+                crate::rs_log!(
                     "[external-open] failed syncing {} back to {}: {}",
                     temp_file.display(),
                     original_path.display(),
@@ -101,6 +101,7 @@ fn watch_external_temp_file(
 }
 
 #[tauri::command]
+#[specta::specta]
 pub(crate) fn open_file_external(
     app: AppHandle,
     state: State<AppState>,
@@ -108,13 +109,20 @@ pub(crate) fn open_file_external(
 ) -> Result<String, AppError> {
     let mut src = src;
     if src.starts_with("file-assets:") && !src.starts_with("file-assets://") {
-        src = src.replacen("file-assets:", "file-assets://", 1);
+        src = src.replacen("file-assets:", "assets://", 1);
+    }
+    // Normalize legacy file-assets:// to assets://
+    if src.starts_with("file-assets://") {
+        src = src.replacen("file-assets://", "assets://", 1);
     }
 
     let full_path = resolve_asset_path_from_uri(&app, &src).unwrap_or_else(|_| PathBuf::from(&src));
     assert_path_access(&app, &state, &full_path, "open file externally")?;
     if !full_path.exists() {
-        return Err(AppError::Other(format!("File not found: {}", full_path.display())));
+        return Err(AppError::Other(format!(
+            "File not found: {}",
+            full_path.display()
+        )));
     }
 
     if let Some(existing_temp) = tracked_temp_file(&app, &full_path) {
@@ -127,7 +135,7 @@ pub(crate) fn open_file_external(
         }
     }
 
-    let temp_dir = state.files.external_open_dir.clone();
+    let temp_dir = state.files.external_open_dir();
     fs::create_dir_all(&temp_dir)?;
     let ext = full_path
         .extension()
@@ -144,7 +152,7 @@ pub(crate) fn open_file_external(
     });
     let raw = fs::read(&full_path)?;
     let payload = decrypt_asset(&app, &state, &full_path, &raw)?;
-    fs::write(&temp_file, payload)?;
+    write_private_bytes(&temp_file, &payload)?;
     track_temp_file(&app, &full_path, &temp_file);
     watch_external_temp_file(app.clone(), full_path.clone(), temp_file.clone())?;
     app.opener()

@@ -1,6 +1,5 @@
 {
   "entry": [
-    "src/index.js",
     "src/lib/comps-ui.js"
   ],
   "project": ["src/**"],
@@ -8,10 +7,21 @@
     "@/*": ["src/*"]
   },
   "ignore": [
-    "vite.config.js",
-    "**/*.css",
-    "**/*.scss",
-    "**/vite.config.*",
-    "src/components/ui/**"
+    "**/*.css"
+  ],
+  "ignoreDependencies": [
+    "@wdio/cli",
+    "@wdio/local-runner",
+    "@wdio/mocha-framework",
+    "@wdio/spec-reporter",
+    "lint-staged",
+    "lib0"
+  ],
+  "ignoreBinaries": [
+    "audit"
+  ],
+  "exclude": [
+    "exports",
+    "types"
   ]
 }
